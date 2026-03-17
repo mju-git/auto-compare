@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Browser data (session, cookies)
+playwright_browser_data/
+chrome_profile/
+
+# Scraped data (user-specific, regenerable)
+cars_market.db
+cars_market_data.json
+
+# Debug/temp files
+*.html
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
