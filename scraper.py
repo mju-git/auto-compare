@@ -573,6 +573,89 @@ def _extract_srp_snapshot_for_link(driver, link_el) -> dict:
     return out
 
 
+def _extract_srp_snapshot_from_card(driver, card_el, base_domain: str) -> dict:
+    """Card-first SRP extraction to avoid promo/DOM nesting issues."""
+    out = {
+        "car_id": "",
+        "url": "",
+        "srp_title": "",
+        "brand": "",
+        "model": "",
+        "srp_price_raw": "",
+        "price_current_eur": None,
+        "price_rating": "",
+        "ad_online_since": "",
+        "vehicle_condition": "",
+    }
+    try:
+        link_el = card_el.find_element(By.CSS_SELECTOR, SELECTORS["srp_link"])
+        href = _get_link_href(driver, link_el)
+        if href and _is_detail_url(href, base_domain):
+            full = _full_url(base_domain, href)
+            out["url"] = full
+            out["car_id"] = _extract_car_id_from_url(full)
+        # Online since comes from the card
+        try:
+            el = card_el.find_element(By.CSS_SELECTOR, SELECTORS["online_since"])
+            out["ad_online_since"] = (el.text or "").strip()
+        except Exception:
+            pass
+    except Exception:
+        link_el = None
+
+    # Headline
+    try:
+        bm_el = card_el.find_element(By.CSS_SELECTOR, SELECTORS["srp_brand_model"])
+        bm_text = (bm_el.text or "").strip()
+        out["srp_title"] = bm_text
+        parts = [p for p in re.split(r"\s+", bm_text) if p]
+        if len(parts) >= 2:
+            out["brand"] = parts[0]
+            out["model"] = parts[1]
+        elif len(parts) == 1:
+            out["brand"] = parts[0]
+    except Exception:
+        pass
+
+    # Price
+    try:
+        price_el = card_el.find_element(By.CSS_SELECTOR, SELECTORS["srp_price"])
+        raw = (price_el.text or "").strip()
+        out["srp_price_raw"] = raw
+        out["price_current_eur"] = _parse_eur_price_to_int(raw)
+    except Exception:
+        pass
+
+    # Price rating label
+    try:
+        pr = card_el.find_element(By.CSS_SELECTOR, SELECTORS["srp_price_rating"])
+        out["price_rating"] = (pr.text or "").strip()
+    except Exception:
+        pass
+
+    # Vehicle condition:
+    # 1) <strong>Pre-Registration</strong> in listing-details-attributes
+    try:
+        vc = card_el.find_element(By.CSS_SELECTOR, SELECTORS["srp_vehicle_condition"])
+        out["vehicle_condition"] = (vc.text or "").strip()
+    except Exception:
+        pass
+    # 2) Fallback: parse first segment before bullet from attributes row text
+    if not out["vehicle_condition"]:
+        try:
+            attrs = card_el.find_element(By.CSS_SELECTOR, "[data-testid='listing-details-attributes']")
+            text = (attrs.text or "").strip()
+            # Often: "Pre-Registration • FR 07/2025 • 10 km • ..."
+            first = (text.split("•", 1)[0] or "").strip()
+            # Avoid returning "FR 07/2025" etc.
+            if first and not first.lower().startswith(("fr", "ez", "first registration", "km")):
+                out["vehicle_condition"] = first
+        except Exception:
+            pass
+
+    return out
+
+
 def _accident_free_from_rule(vehicle_condition: str, mileage_km: str) -> int | None:
     """Return 1/0 from the rule, or None if we can't decide (e.g. missing mileage + no explicit condition)."""
     cond = (vehicle_condition or "").strip().lower()
@@ -1280,52 +1363,67 @@ def phase1_collect_urls(driver, search_url: str, base_domain: str) -> tuple[list
         try:
             cutoff_el = _find_might_also_interest_cutoff_element(driver)
             has_recommendation_section = cutoff_el is not None
-            links = _find_all_by_css(driver, SELECTORS["listing_links"])
+            cards = _find_all_by_css(driver, SELECTORS["srp_card"])
             strict_added = 0
-            for el in links:
-                if not _is_main_srp_result_link(el):
+
+            for card in cards:
+                try:
+                    link_el = card.find_element(By.CSS_SELECTOR, SELECTORS["srp_link"])
+                except Exception:
                     continue
-                if not _is_link_before_recommendation_section(driver, el, cutoff_el):
+                if not _is_link_before_recommendation_section(driver, link_el, cutoff_el):
                     continue
-                href = _get_link_href(driver, el)
-                if not href or not _is_detail_url(href, base_domain):
+
+                # Strict mode: require online-since marker within the card
+                has_online_since = False
+                try:
+                    card.find_element(By.CSS_SELECTOR, SELECTORS["online_since"])
+                    has_online_since = True
+                except Exception:
+                    has_online_since = False
+                if not has_online_since:
                     continue
-                full = _full_url(base_domain, href)
-                if full not in seen:
+
+                snap = _extract_srp_snapshot_from_card(driver, card, base_domain)
+                full = snap.get("url") or ""
+                if not full:
+                    continue
+                if full in seen:
+                    continue
+                seen.add(full)
+                detail_urls.append(full)
+                strict_added += 1
+                if snap.get("ad_online_since"):
+                    url_to_online_since[full] = snap["ad_online_since"]
+                if snap.get("car_id"):
+                    srp_by_car_id[snap["car_id"]] = snap
+
+            # Loose fallback: if strict yielded nothing, accept cards without online-since but still before cutoff
+            if strict_added == 0 and cards:
+                for card in cards:
+                    try:
+                        link_el = card.find_element(By.CSS_SELECTOR, SELECTORS["srp_link"])
+                    except Exception:
+                        continue
+                    if not _is_link_before_recommendation_section(driver, link_el, cutoff_el):
+                        continue
+                    snap = _extract_srp_snapshot_from_card(driver, card, base_domain)
+                    full = snap.get("url") or ""
+                    if not full:
+                        continue
+                    if full in seen:
+                        continue
                     seen.add(full)
                     detail_urls.append(full)
-                    strict_added += 1
-                    online_since = _get_online_since_for_link(driver, el)
-                    if online_since:
-                        url_to_online_since[full] = online_since
-                    snap = _extract_srp_snapshot_for_link(driver, el)
+                    if snap.get("ad_online_since"):
+                        url_to_online_since[full] = snap["ad_online_since"]
                     if snap.get("car_id"):
-                        snap["url"] = full
                         srp_by_car_id[snap["car_id"]] = snap
-            # Some SRP variants do not expose online-since markers on regular cards.
-            # If strict filtering found nothing, retry with a looser pass but still
-            # keep recommendation section exclusion.
-            if strict_added == 0 and links:
-                for el in links:
-                    if not _is_link_before_recommendation_section(driver, el, cutoff_el):
-                        continue
-                    href = _get_link_href(driver, el)
-                    if not href or not _is_detail_url(href, base_domain):
-                        continue
-                    full = _full_url(base_domain, href)
-                    if full not in seen:
-                        seen.add(full)
-                        detail_urls.append(full)
-                        online_since = _get_online_since_for_link(driver, el)
-                        if online_since:
-                            url_to_online_since[full] = online_since
-                        snap = _extract_srp_snapshot_for_link(driver, el)
-                        if snap.get("car_id"):
-                            snap["url"] = full
-                            srp_by_car_id[snap["car_id"]] = snap
                 if page_num == 1:
-                    print("[Phase 1] SRP variant without online-since marker detected; used loose link pass.")
-            if not links and page_num == 1:
+                    print("[Phase 1] SRP variant without online-since marker detected; used loose card pass.")
+
+            # Last fallback: old link-based collection (rare SRP variants without cards)
+            if not cards and page_num == 1:
                 links_fb = _find_all_by_css(driver, SELECTORS["listing_links_fallback"])
                 for el in links_fb:
                     if not _is_link_before_recommendation_section(driver, el, cutoff_el):
@@ -2411,6 +2509,26 @@ def phase2_extract_car(driver, url: str, index: int, total: int) -> dict | None:
         if not origin and ("herkunft" in lbl_lower or "origin" in lbl_lower):
             origin = val
 
+    # Detail-page fallback for vehicle condition (only used if SRP did not provide it)
+    vehicle_condition_detail = ""
+    try:
+        for label in ("Vehicle condition", "Fahrzeugzustand"):
+            try:
+                dd = driver.find_element(
+                    By.XPATH,
+                    f"//dt[normalize-space(.)='{label}']/following-sibling::dd[1]",
+                )
+                vehicle_condition_detail = (dd.text or "").strip()
+                if vehicle_condition_detail:
+                    break
+            except Exception:
+                continue
+        if not vehicle_condition_detail:
+            dd = driver.find_element(By.CSS_SELECTOR, "dd.nuAmT")
+            vehicle_condition_detail = (dd.text or "").strip()
+    except Exception:
+        pass
+
     car = {
         "url": url,
         "title": "",  # dropped from DB v2 (kept empty for compatibility)
@@ -2436,6 +2554,7 @@ def phase2_extract_car(driver, url: str, index: int, total: int) -> dict | None:
         "description": description,
         "seller_type": seller_type,
         "seller_rating": seller_rating,
+        "vehicle_condition": vehicle_condition_detail,
     }
     # Debug summary so you can see what was collected for each car while scraping
     print(f"Saving Car: {title or url[:60]}...")
