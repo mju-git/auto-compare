@@ -42,7 +42,7 @@ flowchart TD
   srpSnapshot --> upsertSrp[Upsert SRP fields into SQLite]
   upsertSrp --> phase2["Phase_2: Detail pages\n(only new car_id rows)"]
   phase2 --> extractDetail[Extract technical + seller fields]
-  extractDetail --> saveDb[Upsert row into SQLite (cars)]
+  extractDetail --> saveDb["Upsert row into SQLite (cars)"]
   saveDb --> exportJson[Export DB to JSON for notebooks/cleaning]
   exportJson --> endNode[End]
 ```
