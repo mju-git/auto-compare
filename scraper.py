@@ -377,6 +377,93 @@ def _migrate_db_drop_extraction_sources() -> None:
         conn.close()
 
 
+def _backfill_after_migrations() -> None:
+    """Fill common v2/v3 fields for legacy rows (safe, idempotent)."""
+    if not DB_PATH.exists():
+        return
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(cars)").fetchall()]
+        if "price_current_eur" in cols and "price_first_eur" in cols:
+            conn.execute(
+                """
+                UPDATE cars
+                SET price_first_eur = price_current_eur
+                WHERE price_first_eur IS NULL
+                  AND price_current_eur IS NOT NULL
+                """
+            )
+        if "srp_title" in cols and "brand" in cols and "model" in cols:
+            rows = conn.execute(
+                """
+                SELECT car_id, srp_title
+                FROM cars
+                WHERE (brand IS NULL OR brand = '')
+                   OR (model IS NULL OR model = '')
+                """
+            ).fetchall()
+            for car_id, srp_title in rows:
+                t = (srp_title or "").strip()
+                if not t:
+                    continue
+                parts = [p for p in re.split(r"\s+", t) if p]
+                if not parts:
+                    continue
+                brand = parts[0]
+                model = parts[1] if len(parts) > 1 else ""
+                conn.execute(
+                    """
+                    UPDATE cars
+                    SET brand = CASE WHEN brand IS NULL OR brand = '' THEN ? ELSE brand END,
+                        model = CASE WHEN model IS NULL OR model = '' THEN ? ELSE model END
+                    WHERE car_id = ?
+                    """,
+                    (brand, model, car_id),
+                )
+
+            # If SRP title is missing for older rows, try to backfill from legacy tables (if present)
+            legacy_tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            for legacy in ("cars_legacy", "cars_legacy_v2"):
+                if legacy not in legacy_tables:
+                    continue
+                legacy_cols = [c[1] for c in conn.execute(f"PRAGMA table_info({legacy})").fetchall()]
+                if "car_id" not in legacy_cols:
+                    continue
+                title_col = "title" if "title" in legacy_cols else None
+                if not title_col:
+                    continue
+                missing = conn.execute(
+                    """
+                    SELECT c.car_id, l.title
+                    FROM cars c
+                    JOIN {legacy} l ON l.car_id = c.car_id
+                    WHERE (c.brand IS NULL OR c.brand = '' OR c.model IS NULL OR c.model = '')
+                      AND l.title IS NOT NULL AND l.title != ''
+                    """.format(legacy=legacy)
+                ).fetchall()
+                for car_id, title in missing:
+                    tt = (title or "").strip()
+                    if not tt:
+                        continue
+                    # Titles were often like "Hyundai TUCSON für €33,940" -> take first two tokens
+                    tt = re.split(r"\s+für\s+", tt, maxsplit=1, flags=re.I)[0].strip()
+                    parts = [p for p in re.split(r"\s+", tt) if p]
+                    if len(parts) < 2:
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE cars
+                        SET brand = CASE WHEN brand IS NULL OR brand = '' THEN ? ELSE brand END,
+                            model = CASE WHEN model IS NULL OR model = '' THEN ? ELSE model END
+                        WHERE car_id = ?
+                        """,
+                        (parts[0], parts[1], car_id),
+                    )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _parse_eur_price_to_int(raw: str) -> int | None:
     """Parse SRP prices like '€28,990' or '28.990 €' into integer euros."""
     if not raw:
@@ -509,6 +596,7 @@ def _init_db() -> None:
     _migrate_db_to_v2()
     # v3 migration (drop extraction_sources)
     _migrate_db_drop_extraction_sources()
+    _backfill_after_migrations()
     # Additive columns for existing v2 DBs
     conn = sqlite3.connect(DB_PATH)
     try:
