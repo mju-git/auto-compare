@@ -1,46 +1,58 @@
-# Mobile.de Car Scraper
+# Car Comparison
 
-A Python scraper for collecting car listings from mobile.de, designed for market research and price comparison.
+A Python project for scraping car listings from mobile.de, cleaning the data, and preparing for analysis and comparison.
 
-## Features
+## Project Structure
 
-- **Anti-bot evasion**: Uses `undetected-chromedriver` to bypass detection
-- **Pagination handling**: Automatically navigates through all search result pages
-- **Comprehensive data extraction**: Collects 25+ fields per car listing
-- **Bilingual support**: Works with both German and English mobile.de interfaces
-- **Robust extraction**: Uses a multi-tier approach to handle different page layouts
-- **Deduplication**: Prevents duplicate entries using unique car IDs
-- **Persistent storage**: SQLite database for crash-safe data collection
-- **Resume capability**: Skips already-scraped cars on subsequent runs
+```
+Car comparison/
+├── data/
+│   ├── raw/                    # Scraper output (untouched)
+│   │   ├── cars_market.db      # SQLite database
+│   │   └── cars_market_data.json
+│   └── processed/              # Cleaned data (right place for analysis)
+│       ├── cars_clean.parquet
+│       └── cars_clean.csv
+├── scripts/
+│   └── clean_cars.py           # Raw → processed pipeline
+├── notebooks/
+│   ├── clean_cars.ipynb       # Explore & define cleaning rules
+│   └── explore_cars.ipynb     # Analysis (loads from processed/)
+├── scraper.py
+├── main.py
+└── requirements.txt
+```
 
-## Collected Fields
+## Data Flow
 
-| Field | Description |
-|-------|-------------|
-| `car_id` | Unique identifier from mobile.de |
-| `title` | Car listing title |
-| `price` | Listed price |
-| `mileage_km` | Odometer reading |
-| `first_registration` | First registration date |
-| `power_hp` / `power_kw` | Engine power |
-| `fuel_type` | Fuel type (Petrol, Diesel, Hybrid, Electric) |
-| `transmission` | Gearbox type |
-| `number_of_owners` | Previous owners |
-| `cubic_capacity` | Engine displacement |
-| `color` / `color_manufacturer` | Exterior color |
-| `interior_design` | Interior material/color |
-| `is_accident_free` | Accident history |
-| `price_rating` | Mobile.de price evaluation |
-| `vehicle_id` | Dealer's internal ID |
-| `trim` | Model variant/trim level |
-| `origin` | Country of origin |
-| `hu` | Next inspection date |
-| `climatisation` | A/C type |
-| `equipment` | Full equipment list |
-| `description` | Seller's description |
-| `seller_type` | Dealer or private |
-| `seller_rating` | Dealer rating (if applicable) |
-| `ad_online_since` | Listing date |
+| Stage | Location | Purpose |
+|-------|----------|---------|
+| **Raw** | `data/raw/` | Scraper output. Never modify. |
+| **Processed** | `data/processed/` | Cleaned data. Use this for analysis. |
+| **Analysis** | `notebooks/` | Load from `data/processed/` only. |
+
+### What happens during scraping (end-to-end)
+
+```mermaid
+flowchart TD
+  start[Start] --> openBrowser[Open Chrome (undetected-chromedriver)]
+  openBrowser --> srpPhase["Phase_1: Search Results (SRP)"]
+  srpPhase --> collectLinks[Collect listing detail URLs]
+  srpPhase --> srpSnapshot["Extract SRP snapshot\nbrand/model/price/price_rating/vehicle_condition/ad_online_since"]
+  srpSnapshot --> upsertSrp[Upsert SRP fields into SQLite]
+  upsertSrp --> soldMark["Mark missing listings as sold\n(last_seen_at='sold' for this search fingerprint)"]
+  collectLinks --> phase2["Phase_2: Detail pages (only missing car_id rows)"]
+  phase2 --> extractDetail[Extract technical + seller fields]
+  extractDetail --> saveDb[Upsert row into SQLite (cars)]
+  saveDb --> exportJson[Export DB to JSON for notebooks/cleaning]
+  exportJson --> endNode[End]
+```
+
+Key rules:
+
+- **Price source of truth**: SRP price is stored as `price_current_eur` (integer EUR). Detail page price is kept only as `detail_price_raw` for debugging.
+- **Accident-free source of truth**: `is_accident_free` is derived deterministically from `vehicle_condition` (explicit accident-free) OR `mileage_km < 100`.
+- **Sold listings**: a listing that was previously seen for the same `source_search` (search fingerprint) but is missing in a later run is **kept** and marked with `last_seen_at = 'sold'`.
 
 ## Installation
 
@@ -48,71 +60,73 @@ A Python scraper for collecting car listings from mobile.de, designed for market
 pip install -r requirements.txt
 ```
 
-**Requirements:**
-- Python 3.9+
-- Google Chrome browser (latest version recommended)
+**Requirements:** Python 3.9+, Google Chrome (latest)
 
 ## Usage
 
-1. Go to [mobile.de](https://www.mobile.de) and create your search filters
-2. Copy the search results URL
-3. Run the scraper:
+### 1. Scrape data
 
 ```bash
 python main.py "https://suchen.mobile.de/fahrzeuge/search.html?..."
 ```
 
-The scraper will:
-1. Open a Chrome browser window (not headless, for CAPTCHA handling)
-2. Navigate through all search result pages
-3. Visit each car listing and extract data
-4. Save results to `cars_market.db` (SQLite) and `cars_market_data.json`
+Saves to `data/raw/cars_market.db` and `cars_market_data.json`.
 
-### Multiple Searches
+Optional: limit detail scraping to a few cars (PowerShell):
 
-You can run multiple searches to build up your dataset. The scraper automatically:
-- Detects cars already in the database
-- Skips duplicates (based on car ID, not URL)
-- Adds only new listings
-
-## Output
-
-### SQLite Database (`cars_market.db`)
-
-Persistent storage with `car_id` as primary key. Use for:
-- Incremental data collection
-- SQL queries and analysis
-
-### JSON Export (`cars_market_data.json`)
-
-Auto-generated after each run. Ready for:
-- Pandas DataFrames
-- Jupyter notebooks
-- Other analysis tools
-
-## Example Analysis
-
-```python
-import pandas as pd
-
-df = pd.read_json("cars_market_data.json")
-print(df[["title", "price", "mileage_km", "first_registration"]].head())
+```powershell
+$env:TEST_MAX_CARS='3'
+python main.py "https://suchen.mobile.de/fahrzeuge/search.html?..."
 ```
 
-## Configuration
+### 2. Clean data
 
-In `scraper.py`, you can modify:
-
-```python
-CLEAR_BEFORE_RUN = False  # Set True to clear DB before each run
+```bash
+python scripts/clean_cars.py
 ```
 
-## Notes
+Reads from `data/raw/`, applies cleaning rules, writes to `data/processed/cars_clean.parquet` and `.csv`.
 
-- The browser window must remain visible (headless mode is disabled for anti-bot reasons)
-- Manual CAPTCHA solving may be required occasionally
-- Random delays between requests are built-in to avoid rate limiting
-- Some fields may be empty if not available on the listing page
+### 3. Analyze
+
+In `notebooks/explore_cars.ipynb`:
+
+```python
+df = pd.read_parquet("../data/processed/cars_clean.parquet")
+```
+
+## Where is the "right" data stored?
+
+**Cleaned data** lives in `data/processed/`:
+
+- **`cars_clean.parquet`** – primary format for analytics (efficient, preserves types)
+- **`cars_clean.csv`** – human-readable backup
+
+You do **not** need a separate database for cleaned data. Parquet is the standard for analytics. If you build a web app later, you can load parquet into memory or connect to a proper DB.
+
+## Customizing the cleaning script
+
+Edit `scripts/clean_cars.py` to:
+
+- Drop columns you don't need
+- Add validation rules
+- Parse dates, standardize fuel types, etc.
+
+Re-run the script after each scrape to refresh `data/processed/`.
+
+## Collected Fields (raw)
+
+`car_id`, `brand`, `model`, `price_current_eur`, `mileage_km`, `first_registration`, `power_hp`, `power_kw`, `fuel_type`, `transmission`, `number_of_owners`, `cubic_capacity`, `color`, `color_manufacturer`, `interior_design`, `trim`, `origin`, `hu`, `climatisation`, `equipment`, `description`, `seller_type`, `seller_rating`, `price_rating`, `vehicle_condition`, `is_accident_free`, `ad_online_since`, `source_search`, and more.
+
+## Next phase: simple online analyzer
+
+Suggested direction:
+
+- Build a small web app that reads **`data/processed/cars_clean.parquet`** (or a derived subset) and provides:
+  - filters (price, km, year, power)
+  - comparisons across trims/years
+  - plots (Plotly) and summary tables
+
 
 ## License
 

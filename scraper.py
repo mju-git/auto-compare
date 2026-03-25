@@ -4,14 +4,17 @@ Phase 1: Collect all listing URLs from search pagination.
 Phase 2: Visit each listing and extract full car data.
 """
 
+import datetime
+import hashlib
 import json
+import os
 import random
 import re
 import sqlite3
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 # Work around Windows "The handle is invalid" (WinError 6) during time.sleep
 # when used with Chrome/driver. Patch time.sleep so it never raises.
@@ -39,19 +42,98 @@ from selenium.webdriver.support import expected_conditions as EC
 
 # --- Configuration ---
 BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_FILE = BASE_DIR / "cars_market_data.json"
-DB_PATH = BASE_DIR / "cars_market.db"
+DATA_RAW = BASE_DIR / "data" / "raw"
+OUTPUT_FILE = DATA_RAW / "cars_market_data.json"
+DB_PATH = DATA_RAW / "cars_market.db"
 MIN_DELAY_SEC = 15
 MAX_DELAY_SEC = 25
 PAGE_LOAD_TIMEOUT = 30
+# Hard stop for SRP pagination (prevents infinite loops if a wrong "Next" is clicked).
+PHASE1_MAX_PAGES = 40
 # Set True to delete existing DB/JSON and re-scrape from scratch. False = skip URLs already in DB.
 CLEAR_BEFORE_RUN = False  # Changed to False to accumulate data across multiple searches
+
+# If True: after collecting URLs for this search, remove DB rows that belong to THIS search
+# fingerprint but were not in the current result set (likely sold / delisted).
+# Safe with multiple searches: only rows tagged with the same search fingerprint are pruned.
+PRUNE_NOT_IN_LATEST_SEARCH = True
+
+# Query params ignored when fingerprinting a search URL (change between sessions but same logical search).
+_SEARCH_FP_IGNORE_PARAMS = frozenset({"searchId", "refId", "ref", "pageNumber", "fn", "_", "lang"})
+
+
+def _search_fingerprint(search_url: str) -> str:
+    """Stable id for a logical search (same filters, ignoring session-specific query params)."""
+    parsed = urlparse(search_url.strip())
+    pairs = [
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if k not in _SEARCH_FP_IGNORE_PARAMS
+    ]
+    pairs.sort()
+    canonical = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(pairs)}"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+
+
+def _details_url_to_search_url(details_url: str) -> str:
+    """Convert a listing/details URL into a search-like URL for fingerprinting.
+
+    We do this because legacy DB rows may not have `source_search` recorded, but
+    they still store query parameters that reflect the original search filters.
+    """
+    parsed = urlparse((details_url or "").strip())
+    # Assume mobile.de SRP path. This matches your Phase-1 `search_url`.
+    search_path = "/fahrzeuge/search.html"
+    return urlunparse((parsed.scheme, parsed.netloc, search_path, "", parsed.query, ""))
+
+
+def _backfill_source_search_for_legacy_rows() -> int:
+    """Fill missing/empty `source_search` for older DB rows so pruning works."""
+    if not PRUNE_NOT_IN_LATEST_SEARCH:
+        return 0
+    if not DB_PATH.exists():
+        return 0
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(cars)").fetchall()]
+        if "source_search" not in cols:
+            return 0
+
+        rows = conn.execute(
+            "SELECT car_id, url FROM cars WHERE source_search IS NULL OR source_search = ''"
+        ).fetchall()
+        if not rows:
+            return 0
+
+        updated = 0
+        for car_id, url in rows:
+            fp = _search_fingerprint(_details_url_to_search_url(url or ""))
+            if not fp:
+                continue
+            conn.execute("UPDATE cars SET source_search = ? WHERE car_id = ?", (fp, car_id))
+            updated += 1
+
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
 
 # Selectors (CSS and XPath for Selenium)
 SELECTORS = {
     # Phase 1: listing page
     "listing_links": "a[href*='details.html'], a[href*='/fahrzeuge/details'], a[href*='details?id=']",
     "listing_links_fallback": "a[href*='mobile.de'][href*='details'], a[href*='details.html']",
+    # SRP card fields (based on your pasted SRP HTML)
+    "srp_card": "article[data-testid^='result-listing-'], article.A3G6X",
+    "srp_link": "a[data-testid^='result-listing-'][href*='details.html']",
+    "srp_brand_model": "h2 span.eO87w",
+    "srp_variant": "h2 span.dc_Br",
+    "srp_price": "[data-testid='main-price-label'] [data-testid='price-label'], [data-testid='price-label']",
+    "srp_price_rating": "[data-testid='main-price-label'] ._u77E, ._u77E",
+    # e.g. "Accident-free", "Used vehicle", "New car", "Pre-registration"
+    "srp_vehicle_condition": "[data-testid='listing-details-attributes'] strong, [data-testid='listing-details'] strong",
     # "Ad online since <date>" on each listing card (search results)
     "online_since": "[data-testid='online-since']",
     # Next button: XPath (Selenium doesn't support :has-text in CSS)
@@ -87,59 +169,359 @@ SELECTORS = {
     "price_rating": "[data-testid='price-evaluation-click'], [data-testid='price-rating'], [class*='price-rating'], ._u77E",
 }
 
+DB_SCHEMA_VERSION = 3
+
+
+def _db_has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    cols = [c[1] for c in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    return col in cols
+
+
+def _migrate_db_to_v2() -> None:
+    """Migrate cars table to v2 schema (drops title/technical_data/vehicle_id, adds SRP price fields).
+
+    SQLite does not support DROP COLUMN reliably, so we create a new table and copy.
+    Old table is kept as `cars_legacy` for rollback.
+    """
+    if not DB_PATH.exists():
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        # If already migrated, skip
+        if _db_has_column(conn, "cars", "price_current_eur") and _db_has_column(conn, "cars", "brand"):
+            return
+
+        # If a previous migration left temporary tables behind, clean up
+        conn.execute("DROP TABLE IF EXISTS cars_v2")
+
+        conn.execute(
+            """
+            CREATE TABLE cars_v2 (
+                car_id TEXT PRIMARY KEY,
+                url TEXT,
+
+                brand TEXT,
+                model TEXT,
+                srp_title TEXT,
+                srp_price_raw TEXT,
+                price_first_eur INTEGER,
+                price_current_eur INTEGER,
+                price_checked_at TEXT,
+
+                detail_price_raw TEXT,
+
+                mileage_km TEXT,
+                first_registration TEXT,
+                power_hp TEXT,
+                power_kw TEXT,
+                number_of_owners TEXT,
+                fuel_type TEXT,
+                transmission TEXT,
+                cubic_capacity TEXT,
+                is_accident_free INTEGER,
+                vehicle_condition TEXT,
+                price_rating TEXT,
+                color_manufacturer TEXT,
+                color TEXT,
+                interior_design TEXT,
+                trim TEXT,
+                origin TEXT,
+                hu TEXT,
+                climatisation TEXT,
+                equipment TEXT,
+                description TEXT,
+                seller_type TEXT,
+                seller_rating TEXT,
+                ad_online_since TEXT,
+                source_search TEXT,
+                last_seen_at TEXT,
+                created_at TEXT
+            )
+            """
+        )
+
+        # Copy what we can from legacy schema.
+        # We keep legacy `price` as detail_price_raw for debugging.
+        conn.execute(
+            """
+            INSERT INTO cars_v2 (
+                car_id, url,
+                brand, model, srp_title, srp_price_raw, price_first_eur, price_current_eur, price_checked_at,
+                detail_price_raw,
+                mileage_km, first_registration, power_hp, power_kw, number_of_owners, fuel_type, transmission,
+                cubic_capacity, is_accident_free, vehicle_condition, price_rating, color_manufacturer, color, interior_design,
+                trim, origin, hu, climatisation,
+                equipment, description, seller_type, seller_rating, ad_online_since,
+                source_search, last_seen_at, created_at
+            )
+            SELECT
+                car_id, url,
+                NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                price,
+                mileage_km, first_registration, power_hp, power_kw, number_of_owners, fuel_type, transmission,
+                cubic_capacity, is_accident_free, NULL, price_rating, color_manufacturer, color, interior_design,
+                trim, origin, hu, climatisation,
+                equipment, description, seller_type, seller_rating, ad_online_since,
+                source_search, last_seen_at, created_at
+            FROM cars
+            """
+        )
+
+        # Swap tables
+        conn.execute("ALTER TABLE cars RENAME TO cars_legacy")
+        conn.execute("ALTER TABLE cars_v2 RENAME TO cars")
+
+        # Basic indexes for lookup/update
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cars_source_search ON cars(source_search)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cars_last_seen_at ON cars(last_seen_at)")
+        conn.commit()
+        print("[DB] Migrated cars table to schema v2 (kept old as cars_legacy).")
+    finally:
+        conn.close()
+
+
+def _migrate_db_drop_extraction_sources() -> None:
+    """v3 migration: drop `extraction_sources` column from active `cars` table.
+
+    Keeps backups:
+      - current `cars` -> `cars_legacy_v2`
+      - new table becomes `cars`
+    """
+    if not DB_PATH.exists():
+        return
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if not _db_has_column(conn, "cars", "extraction_sources"):
+            return
+
+        conn.execute("DROP TABLE IF EXISTS cars_v3")
+        conn.execute(
+            """
+            CREATE TABLE cars_v3 (
+                car_id TEXT PRIMARY KEY,
+                url TEXT,
+
+                brand TEXT,
+                model TEXT,
+                srp_title TEXT,
+                srp_price_raw TEXT,
+                price_first_eur INTEGER,
+                price_current_eur INTEGER,
+                price_checked_at TEXT,
+
+                detail_price_raw TEXT,
+
+                mileage_km TEXT,
+                first_registration TEXT,
+                power_hp TEXT,
+                power_kw TEXT,
+                number_of_owners TEXT,
+                fuel_type TEXT,
+                transmission TEXT,
+                cubic_capacity TEXT,
+                is_accident_free INTEGER,
+                vehicle_condition TEXT,
+                price_rating TEXT,
+                color_manufacturer TEXT,
+                color TEXT,
+                interior_design TEXT,
+                trim TEXT,
+                origin TEXT,
+                hu TEXT,
+                climatisation TEXT,
+                equipment TEXT,
+                description TEXT,
+                seller_type TEXT,
+                seller_rating TEXT,
+                ad_online_since TEXT,
+                source_search TEXT,
+                last_seen_at TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO cars_v3 (
+                car_id, url,
+                brand, model, srp_title, srp_price_raw, price_first_eur, price_current_eur, price_checked_at,
+                detail_price_raw,
+                mileage_km, first_registration, power_hp, power_kw, number_of_owners, fuel_type, transmission,
+                cubic_capacity, is_accident_free, vehicle_condition, price_rating, color_manufacturer, color, interior_design,
+                trim, origin, hu, climatisation,
+                equipment, description, seller_type, seller_rating, ad_online_since,
+                source_search, last_seen_at, created_at
+            )
+            SELECT
+                car_id, url,
+                brand, model, srp_title, srp_price_raw, price_first_eur, price_current_eur, price_checked_at,
+                detail_price_raw,
+                mileage_km, first_registration, power_hp, power_kw, number_of_owners, fuel_type, transmission,
+                cubic_capacity, is_accident_free, vehicle_condition, price_rating, color_manufacturer, color, interior_design,
+                trim, origin, hu, climatisation,
+                equipment, description, seller_type, seller_rating, ad_online_since,
+                source_search, last_seen_at, created_at
+            FROM cars
+            """
+        )
+
+        # Swap tables
+        conn.execute("ALTER TABLE cars RENAME TO cars_legacy_v2")
+        conn.execute("ALTER TABLE cars_v3 RENAME TO cars")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cars_source_search ON cars(source_search)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cars_last_seen_at ON cars(last_seen_at)")
+        conn.commit()
+        print("[DB] Migrated cars table to schema v3 (dropped extraction_sources; kept cars_legacy_v2).")
+    finally:
+        conn.close()
+
+
+def _parse_eur_price_to_int(raw: str) -> int | None:
+    """Parse SRP prices like '€28,990' or '28.990 €' into integer euros."""
+    if not raw:
+        return None
+    t = str(raw).strip()
+    # Remove footnote markers like ¹ and whitespace
+    t = t.replace("¹", "").replace("\xa0", " ").strip()
+    # Keep digits and separators only
+    num = re.sub(r"[^0-9,\.]", "", t)
+    if not num:
+        return None
+    # If both separators exist, treat last separator as decimal, others thousands
+    if "." in num and "," in num:
+        if num.rfind(",") > num.rfind("."):
+            num = num.replace(".", "")
+            num = num.replace(",", ".")
+        else:
+            num = num.replace(",", "")
+    else:
+        # Only one separator type: interpret thousand separators
+        if re.match(r"^\d{1,3}\.\d{3}$", num):
+            num = num.replace(".", "")
+        elif re.match(r"^\d{1,3},\d{3}$", num):
+            num = num.replace(",", "")
+        else:
+            # Decimal commas are unlikely for SRP list prices, but handle safely
+            if "," in num and "." not in num:
+                num = num.replace(",", "")
+    try:
+        value = int(float(num))
+    except Exception:
+        return None
+    # sanity check
+    if not (1000 <= value <= 500000):
+        return None
+    return value
+
+
+def _extract_srp_snapshot_for_link(driver, link_el) -> dict:
+    """Extract SRP card snapshot for this listing link."""
+    out = {
+        "car_id": "",
+        "url": "",
+        "srp_title": "",
+        "brand": "",
+        "model": "",
+        "srp_price_raw": "",
+        "price_current_eur": None,
+        "price_rating": "",
+        "ad_online_since": "",
+        "vehicle_condition": "",
+    }
+    try:
+        href = _get_link_href(driver, link_el)
+        out["url"] = href
+        out["car_id"] = _extract_car_id_from_url(href)
+    except Exception:
+        pass
+    try:
+        card = link_el.find_element(By.XPATH, "./ancestor::article[1]")
+    except Exception:
+        card = None
+    if card is None:
+        return out
+
+    # Headline text: brand/model in span.eO87w
+    try:
+        bm_el = card.find_element(By.CSS_SELECTOR, SELECTORS["srp_brand_model"])
+        bm_text = (bm_el.text or "").strip()
+        out["srp_title"] = bm_text
+        parts = [p for p in re.split(r"\s+", bm_text) if p]
+        if len(parts) >= 2:
+            out["brand"] = parts[0]
+            out["model"] = parts[1]
+        elif len(parts) == 1:
+            out["brand"] = parts[0]
+    except Exception:
+        pass
+
+    # Price
+    try:
+        price_el = card.find_element(By.CSS_SELECTOR, SELECTORS["srp_price"])
+        raw = (price_el.text or "").strip()
+        out["srp_price_raw"] = raw
+        out["price_current_eur"] = _parse_eur_price_to_int(raw)
+    except Exception:
+        pass
+
+    # Price rating label (e.g. "Good price")
+    try:
+        pr = card.find_element(By.CSS_SELECTOR, SELECTORS["srp_price_rating"])
+        out["price_rating"] = (pr.text or "").strip()
+    except Exception:
+        pass
+
+    # Online since
+    try:
+        out["ad_online_since"] = _get_online_since_for_link(driver, link_el)
+    except Exception:
+        pass
+    # Vehicle condition badge ("Accident-free", "Used vehicle", "New car", ...)
+    try:
+        vc = card.find_element(By.CSS_SELECTOR, SELECTORS["srp_vehicle_condition"])
+        out["vehicle_condition"] = (vc.text or "").strip()
+    except Exception:
+        pass
+    return out
+
+
+def _accident_free_from_rule(vehicle_condition: str, mileage_km: str) -> int | None:
+    """Return 1/0 from the rule, or None if we can't decide (e.g. missing mileage + no explicit condition)."""
+    cond = (vehicle_condition or "").strip().lower()
+    if "accident-free" in cond or "unfallfrei" in cond:
+        return 1
+    try:
+        digits = re.sub(r"[^0-9]", "", str(mileage_km or ""))
+        km = int(digits) if digits else None
+    except Exception:
+        km = None
+    if km is None:
+        return None
+    return 1 if km < 100 else 0
+
 
 def _init_db() -> None:
     """Create SQLite DB and table if not exist."""
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS cars (
-            car_id TEXT PRIMARY KEY,
-            url TEXT,
-            title TEXT,
-            price TEXT,
-            mileage_km TEXT,
-            first_registration TEXT,
-            power_hp TEXT,
-            power_kw TEXT,
-            number_of_owners TEXT,
-            fuel_type TEXT,
-            transmission TEXT,
-            cubic_capacity TEXT,
-            is_accident_free INTEGER,
-            price_rating TEXT,
-            color_manufacturer TEXT,
-            color TEXT,
-            interior_design TEXT,
-            vehicle_id TEXT,
-            trim TEXT,
-            origin TEXT,
-            hu TEXT,
-            climatisation TEXT,
-            technical_data TEXT,
-            equipment TEXT,
-            description TEXT,
-            seller_type TEXT,
-            seller_rating TEXT,
-            ad_online_since TEXT,
-            extraction_sources TEXT,
-            created_at TEXT
-        )
-    """)
-    conn.commit()
-    # Add new columns if they were added in a later version
-    for col in ["color_manufacturer", "color", "interior_design", "ad_online_since", "vehicle_id", "trim", "origin", "seller_rating", "hu", "climatisation", "extraction_sources", "car_id"]:
-        try:
-            conn.execute(f"ALTER TABLE cars ADD COLUMN {col} TEXT")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass
     conn.close()
+    # Auto-migrate to v2 once DB exists
+    _migrate_db_to_v2()
+    # v3 migration (drop extraction_sources)
+    _migrate_db_drop_extraction_sources()
+    # Additive columns for existing v2 DBs
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if not _db_has_column(conn, "cars", "vehicle_condition"):
+            conn.execute("ALTER TABLE cars ADD COLUMN vehicle_condition TEXT")
+            conn.commit()
+    finally:
+        conn.close()
 
 
 def _save_car_to_db(car: dict) -> None:
     """Insert or replace one car (by car_id extracted from URL)."""
-    import datetime
-    
+
     # Extract car_id from URL for deduplication
     url = car.get("url", "")
     car_id = _extract_car_id_from_url(url)
@@ -147,17 +529,26 @@ def _save_car_to_db(car: dict) -> None:
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         INSERT OR REPLACE INTO cars (
-            car_id, url, title, price, mileage_km, first_registration, power_hp, power_kw,
+            car_id, url,
+            brand, model, srp_title, srp_price_raw, price_first_eur, price_current_eur, price_checked_at,
+            detail_price_raw,
+            mileage_km, first_registration, power_hp, power_kw,
             number_of_owners, fuel_type, transmission, cubic_capacity, is_accident_free,
-            price_rating, color_manufacturer, color, interior_design,
-            vehicle_id, trim, origin, hu, climatisation,
-            technical_data, equipment, description, seller_type, seller_rating, ad_online_since, extraction_sources, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            vehicle_condition, price_rating, color_manufacturer, color, interior_design,
+            trim, origin, hu, climatisation,
+            equipment, description, seller_type, seller_rating, ad_online_since, source_search, last_seen_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         car_id,
         url,
-        car.get("title", ""),
-        car.get("price", ""),
+        car.get("brand", ""),
+        car.get("model", ""),
+        car.get("srp_title", ""),
+        car.get("srp_price_raw", ""),
+        car.get("price_first_eur", None),
+        car.get("price_current_eur", None),
+        car.get("price_checked_at", ""),
+        car.get("detail_price_raw", ""),
         car.get("mileage_km", ""),
         car.get("first_registration", ""),
         car.get("power_hp", ""),
@@ -167,22 +558,22 @@ def _save_car_to_db(car: dict) -> None:
         car.get("transmission", ""),
         car.get("cubic_capacity", ""),
         1 if car.get("is_accident_free") else 0,
+        car.get("vehicle_condition", ""),
         car.get("price_rating", ""),
         car.get("color_manufacturer", ""),
         car.get("color", ""),
         car.get("interior_design", ""),
-        car.get("vehicle_id", ""),
         car.get("trim", ""),
         car.get("origin", ""),
         car.get("hu", ""),
         car.get("climatisation", ""),
-        json.dumps(car.get("technical_data") or {}, ensure_ascii=False),
         json.dumps(car.get("equipment") or [], ensure_ascii=False),
         car.get("description", ""),
         car.get("seller_type", ""),
         car.get("seller_rating", ""),
         car.get("ad_online_since", ""),
-        car.get("extraction_sources", ""),
+        car.get("source_search", ""),
+        car.get("last_seen_at", ""),
         datetime.datetime.utcnow().isoformat(),
     ))
     conn.commit()
@@ -244,6 +635,59 @@ def _clear_db_and_json() -> None:
         print(f"Cleared JSON: {OUTPUT_FILE}")
 
 
+def _prune_stale_listings_for_search(fingerprint: str, keep_car_ids: set[str]) -> int:
+    """Mark rows as sold that belong to this search fingerprint but are not in keep_car_ids.
+
+    Uses a temp table so large result sets do not hit SQLite's parameter limits.
+    Rows with source_search NULL (legacy) are never removed here.
+    """
+    if not fingerprint or not keep_car_ids:
+        return 0
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("DROP TABLE IF EXISTS _prune_keep")
+        conn.execute("CREATE TEMP TABLE _prune_keep (id TEXT PRIMARY KEY)")
+        conn.executemany("INSERT OR IGNORE INTO _prune_keep (id) VALUES (?)", [(cid,) for cid in keep_car_ids])
+        cur = conn.execute(
+            """
+            UPDATE cars
+            SET last_seen_at = 'sold'
+            WHERE source_search = ?
+              AND car_id NOT IN (SELECT id FROM _prune_keep)
+            """,
+            (fingerprint,),
+        )
+        deleted = cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
+def _mark_seen_car_ids(keep_car_ids: set[str], seen_at_iso: str) -> int:
+    """Set last_seen_at for all car_ids found in current SRP (including skipped ones)."""
+    if not keep_car_ids:
+        return 0
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("DROP TABLE IF EXISTS _seen_keep")
+        conn.execute("CREATE TEMP TABLE _seen_keep (id TEXT PRIMARY KEY)")
+        conn.executemany("INSERT OR IGNORE INTO _seen_keep (id) VALUES (?)", [(cid,) for cid in keep_car_ids])
+        cur = conn.execute(
+            """
+            UPDATE cars
+            SET last_seen_at = ?
+            WHERE car_id IN (SELECT id FROM _seen_keep)
+            """,
+            (seen_at_iso,),
+        )
+        updated = cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
 def _full_url(base_url: str, path: str) -> str:
     if path.startswith("http"):
         return path
@@ -278,62 +722,127 @@ def _find_all_by_css(driver, selector: str):
         return []
 
 
-def _find_next_button(driver) -> bool:
-    """Click the 'Nächste' (Next) pagination button. Returns True if clicked."""
+def _get_link_href(driver, el) -> str:
+    """Robust href extraction for AMP/SPA SRP variants."""
     try:
-        # Get current URL to verify page change later
+        href = (el.get_attribute("href") or "").strip()
+        if href:
+            return href
+    except Exception:
+        pass
+    try:
+        href = driver.execute_script("return arguments[0].href || '';", el)
+        return (href or "").strip()
+    except Exception:
+        return ""
+
+
+def _pagination_element_is_actionable(el) -> bool:
+    """Skip disabled / non-interactive pagination controls."""
+    try:
+        if not el.is_displayed():
+            return False
+        if not el.is_enabled():
+            return False
+        if el.get_attribute("aria-disabled") == "true":
+            return False
+        tag = (el.tag_name or "").lower()
+        if tag == "a":
+            href = (el.get_attribute("href") or "").strip()
+            rel = (el.get_attribute("rel") or "").lower()
+            if href in ("", "#") and "next" not in rel:
+                return False
+        cls = (el.get_attribute("class") or "").lower()
+        if "disabled" in cls or "is-disabled" in cls:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _find_next_button(driver) -> bool:
+    """Click the real search-results 'next' control only.
+
+    Broad selectors like ``aria-label*='Next'`` match carousels/ads and caused
+    infinite pagination while listing count stayed flat. We prefer ``rel='next'``,
+    explicit pagination testids, and XPath text matches; we avoid generic
+    page-wide Next/Weiter buttons.
+    """
+    try:
         current_url = driver.current_url
         current_url_param = re.search(r"[&?]p=(\d+)", current_url)
         current_page = int(current_url_param.group(1)) if current_url_param else 1
-        
-        # Try known XPaths first
-        for xpath in SELECTORS["next_button_xpath"]:
+
+        # 1) rel=next (strong signal for real pagination)
+        for css in (
+            "nav a[rel='next']",
+            "[data-testid*='pagination'] a[rel='next']",
+            "a[rel='next']",
+        ):
             try:
-                el = driver.find_element(By.XPATH, xpath)
-                if el.is_displayed():
-                    print(f"   [Pagination] Clicking next button from page {current_page}...")
+                for el in driver.find_elements(By.CSS_SELECTOR, css):
+                    if not _pagination_element_is_actionable(el):
+                        continue
+                    print(f"   [Pagination] Clicking rel=next (page ~{current_page})...")
                     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
                     time.sleep(0.3)
-                    el.click()
-                    time.sleep(2)  # Wait for page to load
-                    
-                    # Verify page changed
-                    new_url = driver.current_url
-                    print(f"   [Pagination] URL changed: {new_url != current_url}")
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(2)
+                    print(f"   [Pagination] URL changed: {driver.current_url != current_url}")
                     return True
             except Exception:
                 continue
-        
-        # Fallback: generic CSS selectors including pagination:next
-        try:
-            candidates = driver.find_elements(
-                By.CSS_SELECTOR,
-                "[data-testid='pagination:next'], "
-                "[data-testid='pagination-next'], "
-                "button[aria-label*='Next'], a[aria-label*='Next'], "
-                "button[aria-label*='Weiter'], a[aria-label*='Weiter']"
-            )
-            for el in candidates:
-                if el.is_displayed():
-                    print(f"   [Pagination] Clicking next button (fallback CSS selector)...")
+
+        # 2) Known XPaths (Nächste / Weiter on SRP)
+        for xpath in SELECTORS["next_button_xpath"]:
+            try:
+                for el in driver.find_elements(By.XPATH, xpath):
+                    if not _pagination_element_is_actionable(el):
+                        continue
+                    print(f"   [Pagination] Clicking next via XPath (page ~{current_page})...")
                     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
                     time.sleep(0.3)
-                    el.click()
-                    time.sleep(2)  # Wait for page to load
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(2)
+                    print(f"   [Pagination] URL changed: {driver.current_url != current_url}")
                     return True
-        except Exception:
-            pass
+            except Exception:
+                continue
+
+        # 3) Strict: pagination testids only (no global Next/Weiter)
+        for sel in ("[data-testid='pagination:next']", "[data-testid='pagination-next']"):
+            try:
+                for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                    if not _pagination_element_is_actionable(el):
+                        continue
+                    print(f"   [Pagination] Clicking {sel!r}...")
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                    time.sleep(0.3)
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(2)
+                    print(f"   [Pagination] URL changed: {driver.current_url != current_url}")
+                    return True
+            except Exception:
+                continue
+
     except Exception as e:
         print(f"   [Pagination] Error finding next button: {e}")
-    
-    print(f"   [Pagination] No next button found, stopping pagination")
+
+    print("   [Pagination] No suitable next control found, stopping pagination")
     return False
 
 
 def _is_detail_url(href: str, base_domain: str) -> bool:
     if not href or "mobile.de" not in href:
         return False
-    return "details" in href and ("id=" in href or "details.html" in href)
+    href_l = href.lower()
+    # Standard detail URLs
+    if "details" in href_l and ("id=" in href_l or "details.html" in href_l):
+        return True
+    # Some SRP/AMP variants may omit explicit "details" but keep fahrzeuge + id.
+    if "/fahrzeuge/" in href_l and "id=" in href_l:
+        return True
+    return False
 
 
 def _page_is_access_denied(driver) -> bool:
@@ -342,6 +851,83 @@ def _page_is_access_denied(driver) -> bool:
         return "Access denied" in text or "automated access" in text.lower()
     except Exception:
         return False
+
+
+def _find_might_also_interest_cutoff_element(driver):
+    """Return the DOM element where recommendation cards start.
+
+    mobile.de sometimes appends a "You might also be interested" / recommendation
+    section on the last SRP page. We want to avoid scraping those unrelated
+    listings.
+
+    **Important:** A naive XPath like ``//*[contains(normalize-space(.), '…')]`` matches
+    ``html`` / ``body`` first, because *normalize-space(.)* is the entire subtree text.
+    Then every listing link is *contained by* that cutoff and
+    ``compareDocumentPosition`` never sets FOLLOWING — Phase 1 collects zero URLs.
+    We only accept **short** nodes (section headings), not page roots.
+    """
+    # Headings / labels are short; html/body are thousands of characters.
+    _max_own_text_len = 320
+
+    # Longer phrases first so we anchor on the real section title, not a stray short blurb.
+    markers = [
+        "Ähnliche Fahrzeuge, die teilweise Deinen Suchkriterien entsprechen",
+        "Similar vehicles partially matching your search criteria",
+        "Ähnliche Fahrzeuge",
+        "Das könnte Sie auch interessieren",
+        "Das könnte Sie interessieren",
+        "Möglicherweise interessiert",
+        "Das könnte Sie auch mögen",
+        "Das könnte Ihnen auch gefallen",
+        "You might also be interested",
+        "You might be interested",
+        "You might also like",
+        "This might interest you",
+        "Similar vehicles partially matching",
+        "More like this",
+    ]
+    for marker in markers:
+        if "'" in marker and '"' in marker:
+            continue
+        lit = f'"{marker}"' if "'" in marker else f"'{marker}'"
+        xp = (
+            f"//*[contains(normalize-space(.), {lit}) "
+            f"and string-length(normalize-space(.)) <= {_max_own_text_len}]"
+        )
+        try:
+            for el in driver.find_elements(By.XPATH, xp):
+                try:
+                    if el.is_displayed():
+                        return el
+                except Exception:
+                    continue
+            els = driver.find_elements(By.XPATH, xp)
+            if els:
+                return els[0]
+        except Exception:
+            continue
+    return None
+
+
+def _is_link_before_recommendation_section(driver, link_el, cutoff_el) -> bool:
+    """True if link appears in DOM before recommendation cutoff element."""
+    if cutoff_el is None:
+        return True
+    try:
+        # If the cutoff contains the link, cutoff is an ancestor (e.g. mis-picked html/body).
+        # In that case FOLLOWING is never set — treat as no cutoff so we do not drop all links.
+        if driver.execute_script("return arguments[1].contains(arguments[0]);", link_el, cutoff_el):
+            return True
+        return bool(
+            driver.execute_script(
+                "return !!(arguments[0].compareDocumentPosition(arguments[1]) & Node.DOCUMENT_POSITION_FOLLOWING);",
+                link_el,
+                cutoff_el,
+            )
+        )
+    except Exception:
+        # Fail-open to avoid dropping real result links if JS check fails.
+        return True
 
 
 def _click_show_more_sections(driver) -> None:
@@ -459,6 +1045,23 @@ def _click_show_more_sections(driver) -> None:
         pass
 
 
+def _srp_url_with_page_number(url: str, page: int) -> str:
+    """Build SRP URL with pageNumber=N. Preserves duplicate query keys (e.g. multiple ``it=``).
+
+    mobile.de often advances results via JS without updating ``driver.current_url``; using
+    explicit ``pageNumber`` is reliable for collecting all listing pages.
+    """
+    parsed = urlparse(url)
+    pairs = [
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if k.lower() != "pagenumber"
+    ]
+    pairs.append(("pageNumber", str(page)))
+    new_query = urlencode(pairs)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
+
 def _get_online_since_for_link(driver, link_el) -> str:
     """Get 'Ad online since <date>' text from the listing card that contains this link."""
     try:
@@ -473,14 +1076,74 @@ def _get_online_since_for_link(driver, link_el) -> str:
         return ""
 
 
-def phase1_collect_urls(driver, search_url: str, base_domain: str) -> tuple[list[str], dict[str, str]]:
+def _is_main_srp_result_link(link_el) -> bool:
+    """True if link belongs to a primary search-result card.
+
+    The recommendation block ("Similar vehicles ...") often lacks the
+    `online-since` marker. Requiring this marker helps avoid unrelated cards.
+    """
+    try:
+        link_el.find_element(
+            By.XPATH,
+            "./ancestor::*[.//*[@data-testid='online-since']][1]"
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _is_recommendation_block_link(link_el) -> bool:
+    """True if link is inside known recommendation/similar blocks."""
+    rec_markers = [
+        "Ähnliche Fahrzeuge, die teilweise Deinen Suchkriterien entsprechen",
+        "Ähnliche Fahrzeuge",
+        "Similar vehicles partially matching your search criteria",
+        "You might also be interested",
+        "You might be interested",
+        "You might also like",
+        "More like this",
+        "Das könnte Sie auch interessieren",
+        "Das könnte Sie interessieren",
+        "Das könnte Ihnen auch gefallen",
+    ]
+    for marker in rec_markers:
+        try:
+            link_el.find_element(
+                By.XPATH,
+                f"./ancestor::*[contains(normalize-space(.), \"{marker}\")][1]"
+            )
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _extract_reported_results_count(driver) -> int | None:
+    """Try to read the results count shown at top of SRP."""
+    try:
+        text = driver.find_element(By.TAG_NAME, "body").text or ""
+    except Exception:
+        return None
+    # English: "17 results", German: "17 Ergebnisse"
+    m = re.search(r"\b(\d{1,5})\s+(?:results|Ergebnisse)\b", text, re.I)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def phase1_collect_urls(driver, search_url: str, base_domain: str) -> tuple[list[str], dict[str, str], dict[str, dict]]:
     """Navigate search result pages and collect all car detail URLs and their 'ad online since' text.
-    Returns (list of detail URLs, dict mapping URL -> 'Ad online since <date>' text).
+    Returns (list of detail URLs, dict mapping URL -> 'Ad online since <date>' text, srp_snapshot_by_car_id).
     """
     detail_urls: list[str] = []
     url_to_online_since: dict[str, str] = {}
+    srp_by_car_id: dict[str, dict] = {}
     seen: set[str] = set()
     page_num = 1
+    reported_total = None
 
     # Remove pageNumber from URL to always start from page 1
     import re as re_module
@@ -498,6 +1161,9 @@ def phase1_collect_urls(driver, search_url: str, base_domain: str) -> tuple[list
         print(f"[Phase 1] Page loaded: URL={driver.current_url[:80]}... title={driver.title!r}")
     except Exception:
         pass
+    reported_total = _extract_reported_results_count(driver)
+    if reported_total:
+        print(f"[Phase 1] Reported results on page: {reported_total}")
 
     if _page_is_access_denied(driver):
         print("\n*** ACCESS DENIED: mobile.de has blocked automated access. ***")
@@ -507,31 +1173,76 @@ def phase1_collect_urls(driver, search_url: str, base_domain: str) -> tuple[list
         return [], {}
 
     while True:
-        # Scroll down so lazy-loaded listings become visible before collecting links
+        if page_num > PHASE1_MAX_PAGES:
+            print(f"[Phase 1] Stopping: reached PHASE1_MAX_PAGES ({PHASE1_MAX_PAGES}).")
+            break
+
+        count_at_start = len(detail_urls)
+        has_recommendation_section = False
+
+        # Scroll so lazy-loaded listing cards and links are in the DOM
         try:
-            driver.execute_script("window.scrollBy(0, 400);")
-            time.sleep(0.5)
-            driver.execute_script("window.scrollBy(0, 400);")
-            time.sleep(0.3)
+            for _ in range(6):
+                driver.execute_script("window.scrollBy(0, 500);")
+                time.sleep(0.35)
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.6)
         except Exception:
             pass
         try:
+            cutoff_el = _find_might_also_interest_cutoff_element(driver)
+            has_recommendation_section = cutoff_el is not None
             links = _find_all_by_css(driver, SELECTORS["listing_links"])
+            strict_added = 0
             for el in links:
-                href = el.get_attribute("href")
+                if not _is_main_srp_result_link(el):
+                    continue
+                if not _is_link_before_recommendation_section(driver, el, cutoff_el):
+                    continue
+                href = _get_link_href(driver, el)
                 if not href or not _is_detail_url(href, base_domain):
                     continue
                 full = _full_url(base_domain, href)
                 if full not in seen:
                     seen.add(full)
                     detail_urls.append(full)
+                    strict_added += 1
                     online_since = _get_online_since_for_link(driver, el)
                     if online_since:
                         url_to_online_since[full] = online_since
+                    snap = _extract_srp_snapshot_for_link(driver, el)
+                    if snap.get("car_id"):
+                        snap["url"] = full
+                        srp_by_car_id[snap["car_id"]] = snap
+            # Some SRP variants do not expose online-since markers on regular cards.
+            # If strict filtering found nothing, retry with a looser pass but still
+            # keep recommendation section exclusion.
+            if strict_added == 0 and links:
+                for el in links:
+                    if not _is_link_before_recommendation_section(driver, el, cutoff_el):
+                        continue
+                    href = _get_link_href(driver, el)
+                    if not href or not _is_detail_url(href, base_domain):
+                        continue
+                    full = _full_url(base_domain, href)
+                    if full not in seen:
+                        seen.add(full)
+                        detail_urls.append(full)
+                        online_since = _get_online_since_for_link(driver, el)
+                        if online_since:
+                            url_to_online_since[full] = online_since
+                        snap = _extract_srp_snapshot_for_link(driver, el)
+                        if snap.get("car_id"):
+                            snap["url"] = full
+                            srp_by_car_id[snap["car_id"]] = snap
+                if page_num == 1:
+                    print("[Phase 1] SRP variant without online-since marker detected; used loose link pass.")
             if not links and page_num == 1:
                 links_fb = _find_all_by_css(driver, SELECTORS["listing_links_fallback"])
                 for el in links_fb:
-                    href = el.get_attribute("href")
+                    if not _is_link_before_recommendation_section(driver, el, cutoff_el):
+                        continue
+                    href = _get_link_href(driver, el)
                     if href and _is_detail_url(href, base_domain):
                         full = _full_url(base_domain, href)
                         if full not in seen:
@@ -540,22 +1251,81 @@ def phase1_collect_urls(driver, search_url: str, base_domain: str) -> tuple[list
                             online_since = _get_online_since_for_link(driver, el)
                             if online_since:
                                 url_to_online_since[full] = online_since
+                            snap = _extract_srp_snapshot_for_link(driver, el)
+                            if snap.get("car_id"):
+                                snap["url"] = full
+                                srp_by_car_id[snap["car_id"]] = snap
                 if detail_urls:
                     print("[Phase 1] Fallback: collected URLs from broader link selector.")
         except Exception as e:
             print(f"[Phase 1] Warning extracting links on page {page_num}: {e}")
 
-        print(f"[Phase 1] Page {page_num}: found {len(detail_urls)} total listing URLs so far.")
+        new_this_page = len(detail_urls) - count_at_start
+        print(
+            f"[Phase 1] Page {page_num}: +{new_this_page} new this page, "
+            f"{len(detail_urls)} total listing URLs so far."
+        )
 
-        # Check if there's a next button before trying to click it
-        has_next = _find_next_button(driver)
-        if not has_next:
-            print(f"[Phase 1] No more pages (stopped at page {page_num}).")
+        # If top-of-page reports total results, treat it as a hard upper bound.
+        # This protects against accidental leakage from recommendation sections.
+        if page_num == 1 and reported_total and len(detail_urls) > reported_total:
+            detail_urls = detail_urls[:reported_total]
+            seen = set(detail_urls)
+            url_to_online_since = {u: url_to_online_since[u] for u in detail_urls if u in url_to_online_since}
+            new_this_page = len(detail_urls) - count_at_start
+            print(
+                f"[Phase 1] Trimmed to reported total ({reported_total}) to exclude non-result links."
+            )
+
+        # Single-page searches commonly show recommendations below the real results.
+        # If page 1 has fewer than one full page of main results and recommendation
+        # section is already present, treat it as end-of-results.
+        if page_num == 1 and has_recommendation_section and new_this_page < 30:
+            print(
+                "[Phase 1] Recommendation section detected on page 1 with fewer than 30 results; "
+                "treating as single-page search and stopping pagination."
+            )
             break
-        page_num += 1
-        time.sleep(1 + random.uniform(0.5, 1.5))
+        if page_num == 1 and reported_total and len(detail_urls) >= reported_total:
+            print(
+                f"[Phase 1] Collected {len(detail_urls)} links, meeting reported total ({reported_total}); "
+                "stopping pagination."
+            )
+            break
 
-    return detail_urls, url_to_online_since
+        if new_this_page == 0:
+            if page_num == 1 and len(detail_urls) == 0:
+                print("[Phase 1] No listings on the first page.")
+            elif page_num > 1:
+                print(
+                    f"[Phase 1] No new listings on page {page_num} (end of results or empty page). "
+                    "Stopping pagination."
+                )
+            break
+
+        # Next page: use pageNumber in URL (reliable; clicks often don't change URL on SPA SRP).
+        next_page = page_num + 1
+        if next_page > PHASE1_MAX_PAGES:
+            print(f"[Phase 1] Stopping: next page would exceed PHASE1_MAX_PAGES ({PHASE1_MAX_PAGES}).")
+            break
+        try:
+            base_for_paging = driver.current_url or search_url
+            next_url = _srp_url_with_page_number(base_for_paging, next_page)
+        except Exception as e:
+            print(f"[Phase 1] Could not build next-page URL: {e}. Trying click-based pagination.")
+            if not _find_next_button(driver):
+                print(f"[Phase 1] No more pages (stopped at page {page_num}).")
+                break
+            page_num += 1
+            time.sleep(1 + random.uniform(0.5, 1.5))
+            continue
+
+        print(f"[Phase 1] Loading search page {next_page} (pageNumber={next_page})...")
+        driver.get(next_url)
+        time.sleep(2.5 + random.uniform(0.5, 1.2))
+        page_num = next_page
+
+    return detail_urls, url_to_online_since, srp_by_car_id
 
 
 def _parse_specs_from_text(text: str) -> dict:
@@ -1079,40 +1849,29 @@ def _extract_from_dl(driver) -> dict:
     except Exception:
         pass
     
-    # Track which extraction sources were used
-    sources_used = []
-    if any(out.values()):
-        sources_used.append("dl")
-    
     # ATTEMPT 2: Extract from key features section (icon grid at top of page)
     key_features_data = _extract_from_key_features_section(driver)
     if any(key_features_data.values()):
-        sources_used.append("key_features")
         # Merge with out (key features fills in gaps)
         for key, value in key_features_data.items():
             if value and not out.get(key):
                 out[key] = value
-    
+
     # ATTEMPT 3: Fall back to icon grid layout (data-testid based)
     icon_grid_data = _extract_from_icon_grid(driver)
     if any(icon_grid_data.values()):
-        sources_used.append("icon_grid")
         # Merge with out (icon_grid fills in gaps)
         for key, value in icon_grid_data.items():
             if value and not out.get(key):
                 out[key] = value
-    
+
     # ATTEMPT 4: Fall back to text-based extraction (most flexible)
     text_data = _extract_from_page_text(driver)
     if any(text_data.values()):
-        sources_used.append("text")
         # Merge with out (text_data fills in gaps)
         for key, value in text_data.items():
             if value and not out.get(key):
                 out[key] = value
-    
-    # Add extraction sources to output
-    out["_extraction_sources"] = "+".join(sources_used) if sources_used else "none"
     
     return out  # Return whatever we collected
 
@@ -1282,17 +2041,11 @@ def phase2_extract_car(driver, url: str, index: int, total: int) -> dict | None:
     hu = specs.get("hu", "")
     climatisation = specs.get("climatisation", "")
     
+    # Accident-free is no longer derived from detail page text/heuristics.
+    # Canonical rule is applied at save time using SRP `vehicle_condition` OR mileage<100km.
     is_accident_free = False
-    technical_data: dict[str, str] = {}
 
-    # Check accident-free status from HU field
-    try:
-        hu_status = hu.lower() if hu else ""
-        if "new" in hu_status or "nu" in hu_status:
-            is_accident_free = True
-    except Exception:
-        pass
-
+    # Detail-page title and price are no longer canonical (SRP is source of truth).
     title = _find_first_by_css(driver, SELECTORS["title"])
     if not title:
         try:
@@ -1302,7 +2055,7 @@ def phase2_extract_car(driver, url: str, index: int, total: int) -> dict | None:
         except Exception:
             pass
 
-    price = ""
+    price = ""  # kept only as debug `detail_price_raw`
     try:
         # Strategy 1: Look for data-testid="prime-price" or similar main price
         for sel in [
@@ -1497,17 +2250,7 @@ def phase2_extract_car(driver, url: str, index: int, total: int) -> dict | None:
         except Exception:
             pass
 
-    # is_accident_free: set True if body contains Unfallfrei (and not Unfallfahrzeug)
-    try:
-        body_text = driver.find_element(By.TAG_NAME, "body").text
-        body_lower = body_text.lower()
-        if "unfallfrei" in body_lower or "accident-free" in body_lower:
-            if "unfallfahrzeug" not in body_lower:
-                is_accident_free = True
-        if "unfallfahrzeug" in body_lower or ("schaden" in body_lower and "unfallfrei" not in body_lower):
-            is_accident_free = False
-    except Exception:
-        pass
+    # (removed) detail-page accident heuristics
 
     seller_type = "Unbekannt"
     seller_rating = ""
@@ -1582,8 +2325,8 @@ def phase2_extract_car(driver, url: str, index: int, total: int) -> dict | None:
 
     car = {
         "url": url,
-        "title": title,
-        "price": price,
+        "title": "",  # dropped from DB v2 (kept empty for compatibility)
+        "price": price,  # detail price raw (debug only)
         "mileage_km": specs.get("mileage_km") or specs.get("mileage"),
         "first_registration": specs["first_registration"],
         "power_hp": specs["power_hp"],
@@ -1597,33 +2340,28 @@ def phase2_extract_car(driver, url: str, index: int, total: int) -> dict | None:
         "color_manufacturer": color_manufacturer,
         "color": color,
         "interior_design": interior_design,
-        "vehicle_id": vehicle_id,
         "trim": trim,
         "origin": origin,
         "hu": hu,
         "climatisation": climatisation,
-        "technical_data": technical_data,
         "equipment": equipment,
         "description": description,
         "seller_type": seller_type,
         "seller_rating": seller_rating,
-        "extraction_sources": specs.get("_extraction_sources", "unknown"),
     }
     # Debug summary so you can see what was collected for each car while scraping
-    extraction_sources = specs.get("_extraction_sources", "unknown")
     print(f"Saving Car: {title or url[:60]}...")
     try:
         print(
             f"  URL: {url}\n"
-            f"  Price: {price} | Mileage: {specs.get('mileage_km') or specs.get('mileage')} | First reg: {specs['first_registration']}\n"
+            f"  Detail price (debug): {price} | Mileage: {specs.get('mileage_km') or specs.get('mileage')} | First reg: {specs['first_registration']}\n"
             f"  Power: {specs['power_hp']} PS / {specs['power_kw']} kW | Fuel: {specs['fuel_type']} | Transmission: {specs['transmission']}\n"
-            f"  Vehicle ID: {vehicle_id} | Trim: {trim} | Origin: {origin}\n"
+            f"  Trim: {trim} | Origin: {origin}\n"
             f"  Owners: {specs['number_of_owners']} | Cubic Capacity: {specs['cubic_capacity']} | Color: {color} / {color_manufacturer}\n"
             f"  Interior: {interior_design} | HU: {hu} | Climatisation: {climatisation}\n"
             f"  Equipment: {len(equipment)} items | Description: {len(description)} chars\n"
             f"  Accident-free: {is_accident_free} | Seller: {seller_type} (rating: {seller_rating})\n"
             f"  Price rating: {price_rating}\n"
-            f"  [Extraction sources: {extraction_sources}]"
         )
     except Exception:
         # Never let debug printing break the scraper
@@ -1638,27 +2376,31 @@ def _export_db_to_json() -> None:
     try:
         conn = sqlite3.connect(DB_PATH)
         rows = conn.execute("""
-            SELECT car_id, url, title, price, mileage_km, first_registration, power_hp, power_kw,
+            SELECT car_id, url,
+                   brand, model, srp_title, srp_price_raw, price_first_eur, price_current_eur, price_checked_at,
+                   detail_price_raw,
+                   mileage_km, first_registration, power_hp, power_kw,
                    number_of_owners, fuel_type, transmission, cubic_capacity, is_accident_free,
-                   price_rating, color_manufacturer, color, interior_design,
-                   vehicle_id, trim, origin, hu, climatisation,
-                   technical_data, equipment, description, seller_type, seller_rating, ad_online_since, extraction_sources
+                   vehicle_condition, price_rating, color_manufacturer, color, interior_design,
+                   trim, origin, hu, climatisation,
+                   equipment, description, seller_type, seller_rating, ad_online_since, source_search, last_seen_at
             FROM cars ORDER BY created_at
         """).fetchall()
         conn.close()
-        cols = ["car_id", "url", "title", "price", "mileage_km", "first_registration", "power_hp", "power_kw",
+        cols = [
+            "car_id", "url",
+            "brand", "model", "srp_title", "srp_price_raw", "price_first_eur", "price_current_eur", "price_checked_at",
+            "detail_price_raw",
+            "mileage_km", "first_registration", "power_hp", "power_kw",
                 "number_of_owners", "fuel_type", "transmission", "cubic_capacity", "is_accident_free",
-                "price_rating", "color_manufacturer", "color", "interior_design",
-                "vehicle_id", "trim", "origin", "hu", "climatisation",
-                "technical_data", "equipment", "description", "seller_type", "seller_rating", "ad_online_since", "extraction_sources"]
+                "vehicle_condition", "price_rating", "color_manufacturer", "color", "interior_design",
+                "trim", "origin", "hu", "climatisation",
+                "equipment", "description", "seller_type", "seller_rating", "ad_online_since", "source_search", "last_seen_at",
+        ]
         cars = []
         for r in rows:
             d = dict(zip(cols, r))
             d["is_accident_free"] = bool(d["is_accident_free"])
-            try:
-                d["technical_data"] = json.loads(d["technical_data"] or "{}")
-            except Exception:
-                d["technical_data"] = {}
             try:
                 d["equipment"] = json.loads(d["equipment"] or "[]")
             except Exception:
@@ -1678,15 +2420,26 @@ def run_scraper(search_url: str) -> None:
 
     parsed = urlparse(search_url)
     base_domain = f"{parsed.scheme}://{parsed.netloc}"
+    search_fp = _search_fingerprint(search_url)
 
     if CLEAR_BEFORE_RUN:
         _clear_db_and_json()
 
+    DATA_RAW.mkdir(parents=True, exist_ok=True)
     _init_db()
-    existing_car_ids = _load_existing_car_ids_from_db() if not CLEAR_BEFORE_RUN else set()
-    existing_count = len(existing_car_ids)
+    before_db_count = len(_load_existing_car_ids_from_db()) if not CLEAR_BEFORE_RUN else 0
+    if PRUNE_NOT_IN_LATEST_SEARCH:
+        try:
+            updated = _backfill_source_search_for_legacy_rows()
+            if updated:
+                print(f"[Backfill] Filled source_search for {updated} legacy row(s).")
+        except Exception as e:
+            print(f"[Backfill] source_search backfill failed (continuing anyway): {e}")
 
     driver = None
+    scraped_new = 0
+    pruned_count = 0
+    run_seen_at = datetime.datetime.utcnow().isoformat()
     try:
         options = uc.ChromeOptions()
         # Force English UI so mobile.de shows "Good price", "Vehicle description", etc.
@@ -1694,7 +2447,7 @@ def run_scraper(search_url: str) -> None:
         driver = uc.Chrome(version_main=145, options=options, headless=False)
         driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
 
-        detail_urls, url_to_online_since = phase1_collect_urls(driver, search_url, base_domain)
+        detail_urls, url_to_online_since, srp_by_car_id = phase1_collect_urls(driver, search_url, base_domain)
         total = len(detail_urls)
         print(f"Found {total} total cars in search results.")
 
@@ -1703,11 +2456,86 @@ def run_scraper(search_url: str) -> None:
             time.sleep(30)
             return
 
-        # Filter out cars already in DB (by car ID, not full URL - more reliable deduplication)
+        # Remove listings that disappeared from this search (same fingerprint only).
+        keep_ids = {_extract_car_id_from_url(u) for u in detail_urls}
+        marked = _mark_seen_car_ids(keep_ids, run_seen_at)
+        if marked:
+            print(f"Marked {marked} existing listing(s) as seen at {run_seen_at}.")
+        if PRUNE_NOT_IN_LATEST_SEARCH:
+            pruned_count = _prune_stale_listings_for_search(search_fp, keep_ids)
+            if pruned_count:
+                print(
+                    f"Marked {pruned_count} listing(s) as sold (no longer in this search). "
+                    f"Search scope: fingerprint {search_fp}."
+                )
+
+        # Reload after prune so we don't skip cars that were just removed from DB.
+        existing_car_ids = _load_existing_car_ids_from_db() if not CLEAR_BEFORE_RUN else set()
         to_visit = [u for u in detail_urls if _extract_car_id_from_url(u) not in existing_car_ids]
         skipped = total - len(to_visit)
         if skipped > 0:
             print(f"Skipping {skipped} cars already in database. {len(to_visit)} new cars to scrape.")
+
+        # Always upsert SRP snapshot fields (brand/model/current price) for all seen cars.
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            for cid, snap in (srp_by_car_id or {}).items():
+                if not cid:
+                    continue
+                price_now = snap.get("price_current_eur")
+                raw_now = snap.get("srp_price_raw") or ""
+                brand = snap.get("brand") or ""
+                model = snap.get("model") or ""
+                srp_title = snap.get("srp_title") or ""
+                price_rating = snap.get("price_rating") or ""
+                vehicle_condition = snap.get("vehicle_condition") or ""
+                # Read current mileage so we can apply the canonical accident-free rule consistently,
+                # even for cars that are skipped in Phase 2.
+                row2 = conn.execute(
+                    "SELECT mileage_km, is_accident_free FROM cars WHERE car_id = ?",
+                    (cid,),
+                ).fetchone()
+                existing_mileage = row2[0] if row2 else ""
+                existing_is_af = row2[1] if row2 else None
+                new_is_af = _accident_free_from_rule(vehicle_condition, existing_mileage)
+                if new_is_af is None:
+                    new_is_af = existing_is_af
+                # Get existing first price
+                row = conn.execute(
+                    "SELECT price_first_eur FROM cars WHERE car_id = ?",
+                    (cid,),
+                ).fetchone()
+                first_price = row[0] if row else None
+                conn.execute(
+                    """
+                    UPDATE cars
+                    SET brand = COALESCE(NULLIF(?, ''), brand),
+                        model = COALESCE(NULLIF(?, ''), model),
+                        srp_title = COALESCE(NULLIF(?, ''), srp_title),
+                        srp_price_raw = COALESCE(NULLIF(?, ''), srp_price_raw),
+                        price_first_eur = CASE
+                            WHEN price_first_eur IS NULL AND ? IS NOT NULL THEN ?
+                            ELSE price_first_eur
+                        END,
+                        price_current_eur = COALESCE(?, price_current_eur),
+                        price_checked_at = ?,
+                        vehicle_condition = COALESCE(NULLIF(?, ''), vehicle_condition),
+                        is_accident_free = COALESCE(?, is_accident_free),
+                        price_rating = COALESCE(NULLIF(?, ''), price_rating)
+                    WHERE car_id = ?
+                    """,
+                    (brand, model, srp_title, raw_now, price_now, price_now, price_now, run_seen_at, vehicle_condition, new_is_af, price_rating, cid),
+                )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[SRP] Warning: could not persist SRP snapshot fields: {e}")
+
+        # Optional test limit for safe verification on a few cars
+        test_limit = int(os.environ.get("TEST_MAX_CARS", "0") or "0")
+        if test_limit and len(to_visit) > test_limit:
+            print(f"[TEST] Limiting Phase 2 to first {test_limit} cars (set TEST_MAX_CARS=0 to disable).")
+            to_visit = to_visit[:test_limit]
 
         for i, url in enumerate(to_visit, start=1):
             delay = random.uniform(MIN_DELAY_SEC, MAX_DELAY_SEC)
@@ -1718,6 +2546,25 @@ def run_scraper(search_url: str) -> None:
                 car = phase2_extract_car(driver, url, i, len(to_visit))
                 if car:
                     car["ad_online_since"] = url_to_online_since.get(car.get("url") or url, "")
+                    car["last_seen_at"] = run_seen_at
+                    # carry SRP canonical fields into the row being saved (brand/model/prices)
+                    cid = _extract_car_id_from_url(car.get("url") or url)
+                    snap = (srp_by_car_id or {}).get(cid) or {}
+                    car["brand"] = snap.get("brand", car.get("brand", ""))
+                    car["model"] = snap.get("model", car.get("model", ""))
+                    car["srp_title"] = snap.get("srp_title", car.get("srp_title", ""))
+                    car["srp_price_raw"] = snap.get("srp_price_raw", car.get("srp_price_raw", ""))
+                    car["price_current_eur"] = snap.get("price_current_eur", car.get("price_current_eur", None))
+                    car["vehicle_condition"] = snap.get("vehicle_condition", car.get("vehicle_condition", ""))
+                    # Apply canonical rule (only source of truth)
+                    car["is_accident_free"] = bool(
+                        _accident_free_from_rule(car.get("vehicle_condition", ""), car.get("mileage_km", "")) == 1
+                    )
+                    # price_first_eur is set via the SRP upsert update; keep None here so DB keeps existing
+                    car["price_first_eur"] = None
+                    car["price_checked_at"] = run_seen_at
+                    # keep detail price as debug only
+                    car["detail_price_raw"] = car.get("price", "")
                     _save_car_to_db(car)
                     _export_db_to_json()
             except Exception as e:
@@ -1736,8 +2583,12 @@ def run_scraper(search_url: str) -> None:
 
     _export_db_to_json()
     n = len(_load_existing_car_ids_from_db())
-    new_cars = n - existing_count
-    print(f"Done. Added {new_cars} new cars. Total cars in DB: {n}. Exported to {OUTPUT_FILE}")
+    if pruned_count:
+        print(f"Pruned (this run): {pruned_count}")
+    print(
+        f"Done. Scraped {scraped_new} new listing(s). Total cars in DB: {n} "
+        f"(was {before_db_count} before this run). Exported to {OUTPUT_FILE}"
+    )
 
 
 if __name__ == "__main__":

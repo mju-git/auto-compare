@@ -19,7 +19,17 @@ ENV/
 playwright_browser_data/
 chrome_profile/
 
-# Scraped data (user-specific, regenerable)
+# Local notebooks
+notebooks/*.ipynb
+
+# Data (regenerable - keep raw/processed out of repo)
+data/raw/*.db
+data/raw/*.json
+data/processed/*.parquet
+data/processed/*.csv
+data/processed/*.json
+
+# Legacy paths (if files still at root)
 cars_market.db
 cars_market_data.json
 
