@@ -15,9 +15,7 @@ Car comparison/
 │       └── cars_clean.csv
 ├── scripts/
 │   └── clean_cars.py           # Raw → processed pipeline
-├── notebooks/
-│   ├── clean_cars.ipynb       # Explore & define cleaning rules
-│   └── explore_cars.ipynb     # Analysis (loads from processed/)
+├── notebooks/                  # Not tracked (local only; see notebooks/README.md)
 ├── scraper.py
 ├── main.py
 └── requirements.txt
@@ -38,10 +36,11 @@ flowchart TD
   start[Start] --> openBrowser[Open Chrome (undetected-chromedriver)]
   openBrowser --> srpPhase["Phase_1: Search Results (SRP)"]
   srpPhase --> collectLinks[Collect listing detail URLs]
-  srpPhase --> srpSnapshot["Extract SRP snapshot\nbrand/model/price/price_rating/vehicle_condition/ad_online_since"]
+  collectLinks --> markSeen["Mark all seen listing IDs\n(last_seen_at = run_timestamp)"]
+  markSeen --> soldMark["Mark missing listings as sold\n(last_seen_at='sold' for this search fingerprint)"]
+  collectLinks --> srpSnapshot["Extract SRP snapshot\nbrand/model/price/price_rating/vehicle_condition/ad_online_since"]
   srpSnapshot --> upsertSrp[Upsert SRP fields into SQLite]
-  upsertSrp --> soldMark["Mark missing listings as sold\n(last_seen_at='sold' for this search fingerprint)"]
-  collectLinks --> phase2["Phase_2: Detail pages (only missing car_id rows)"]
+  upsertSrp --> phase2["Phase_2: Detail pages\n(only new car_id rows)"]
   phase2 --> extractDetail[Extract technical + seller fields]
   extractDetail --> saveDb[Upsert row into SQLite (cars)]
   saveDb --> exportJson[Export DB to JSON for notebooks/cleaning]
@@ -89,11 +88,9 @@ Reads from `data/raw/`, applies cleaning rules, writes to `data/processed/cars_c
 
 ### 3. Analyze
 
-In `notebooks/explore_cars.ipynb`:
+Use your own local notebook (not committed) and load:
 
-```python
-df = pd.read_parquet("../data/processed/cars_clean.parquet")
-```
+`data/processed/cars_clean.parquet`
 
 ## Where is the "right" data stored?
 
