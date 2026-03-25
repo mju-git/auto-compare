@@ -33,11 +33,11 @@ Car comparison/
 
 ```mermaid
 flowchart TD
-  start[Start] --> openBrowser[Open Chrome (undetected-chromedriver)]
+  start[Start] --> openBrowser["Open Chrome (undetected-chromedriver)"]
   openBrowser --> srpPhase["Phase_1: Search Results (SRP)"]
   srpPhase --> collectLinks[Collect listing detail URLs]
   collectLinks --> markSeen["Mark all seen listing IDs\n(last_seen_at = run_timestamp)"]
-  markSeen --> soldMark["Mark missing listings as sold\n(last_seen_at='sold' for this search fingerprint)"]
+  markSeen --> soldMark["Mark missing listings as sold\n(last_seen_at = 'sold' for this search fingerprint)"]
   collectLinks --> srpSnapshot["Extract SRP snapshot\nbrand/model/price/price_rating/vehicle_condition/ad_online_since"]
   srpSnapshot --> upsertSrp[Upsert SRP fields into SQLite]
   upsertSrp --> phase2["Phase_2: Detail pages\n(only new car_id rows)"]
