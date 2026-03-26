@@ -2762,7 +2762,9 @@ def run_scraper(search_url: str) -> None:
                     car["srp_title"] = snap.get("srp_title", car.get("srp_title", ""))
                     car["srp_price_raw"] = snap.get("srp_price_raw", car.get("srp_price_raw", ""))
                     car["price_current_eur"] = snap.get("price_current_eur", car.get("price_current_eur", None))
-                    car["vehicle_condition"] = snap.get("vehicle_condition", car.get("vehicle_condition", ""))
+                    # Prefer detail-page condition (more stable), only fill from SRP if we don't have it.
+                    if not (car.get("vehicle_condition") or "").strip():
+                        car["vehicle_condition"] = snap.get("vehicle_condition", "")
                     # Apply canonical rule (only source of truth)
                     car["is_accident_free"] = bool(
                         _accident_free_from_rule(car.get("vehicle_condition", ""), car.get("mileage_km", "")) == 1

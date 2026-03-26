@@ -25,6 +25,7 @@ notebooks/*.ipynb
 # Data (regenerable - keep raw/processed out of repo)
 data/raw/*.db
 data/raw/*.json
+data/raw/*.db-journal
 data/processed/*.parquet
 data/processed/*.csv
 data/processed/*.json
