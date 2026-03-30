@@ -77,37 +77,37 @@ def main() -> None:
     st.set_page_config(page_title="Auto Compare", layout="wide")
     st.title("Auto Compare")
 
-    tab_demo, tab_upload, tab_howto = st.tabs(["Demo", "Upload", "How it works"])
-
     uploaded_bytes: bytes | None = None
-    with tab_upload:
-        st.subheader("Upload your dataset")
-        st.write("Upload `cars_clean.parquet` (generated locally) to get the full dashboard.")
-        up = st.file_uploader("Choose `cars_clean.parquet`", type=["parquet"])
-        if up is not None:
-            uploaded_bytes = up.getvalue()
+    use_repo_fallback = True
+    with st.sidebar:
+        st.header("Dataset")
+        with st.expander("Upload `cars_clean.parquet`", expanded=False):
+            st.write("Optional. Upload your cleaned dataset to analyze it here.")
+            up = st.file_uploader("Choose file", type=["parquet"])
+            if up is not None:
+                uploaded_bytes = up.getvalue()
 
-        st.caption(
-            "Streamlit Cloud upload limit is usually ~200MB by default. "
-            "If your parquet is larger, we can reduce columns or compress further."
-        )
+            st.caption(
+                "Streamlit Cloud upload limit is usually ~200MB by default. "
+                "If your parquet is larger, we can reduce columns or compress further."
+            )
+        use_repo_fallback = st.checkbox("Use demo dataset fallback", value=(uploaded_bytes is None))
 
-    with tab_howto:
-        st.subheader("How easy is this for any person?")
-        st.write("It’s a simple 2-step flow:")
-        st.write("1) Run the scraper locally (so cookie banners / access checks can be solved).")
-        st.write("2) Upload one file (`cars_clean.parquet`) to this app.")
-        st.code(
-            "\n".join(
-                [
-                    "pip install -r requirements.txt",
-                    "python main.py \"<mobile.de search URL>\"",
-                    "python scripts/clean_cars.py",
-                ]
-            ),
-            language="bash",
-        )
-        st.write("Then upload: `data/processed/cars_clean.parquet`.")
+        with st.expander("How it works", expanded=False):
+            st.write("2-step flow for any user:")
+            st.write("1) Scrape locally (so cookie banners / access checks can be solved).")
+            st.write("2) Upload one file (`cars_clean.parquet`) to this app.")
+            st.code(
+                "\n".join(
+                    [
+                        "pip install -r requirements.txt",
+                        "python main.py \"<mobile.de search URL>\"",
+                        "python scripts/clean_cars.py",
+                    ]
+                ),
+                language="bash",
+            )
+            st.write("Then upload: `data/processed/cars_clean.parquet`.")
 
     df: pd.DataFrame | None = None
     dataset_label = ""
@@ -120,18 +120,14 @@ def main() -> None:
             st.error(f"Failed to read uploaded parquet: {e}")
             st.stop()
     else:
-        with tab_demo:
-            st.subheader("Demo (current design)")
-            st.write("This is what the dashboard looks like with a dataset loaded.")
-            st.caption("To use your own data, go to the Upload tab.")
-        ensure_clean_parquet()
-        if DATA_PATH.exists():
-            df = load_data_from_path(DATA_PATH)
-            dataset_label = "Demo dataset (repo/local)"
+        if use_repo_fallback:
+            ensure_clean_parquet()
+            if DATA_PATH.exists():
+                df = load_data_from_path(DATA_PATH)
+                dataset_label = "Demo dataset"
 
     if df is None:
-        with tab_demo:
-            st.info("No demo dataset found. Upload `cars_clean.parquet` in the Upload tab to begin.")
+        st.info("Upload `cars_clean.parquet` from the sidebar to begin.")
         st.stop()
 
     missing_cols = validate_dataset(df)
@@ -153,7 +149,8 @@ def main() -> None:
 
     # Quick QA
     with st.expander("Dataset QA", expanded=False):
-        st.caption(dataset_label)
+        if dataset_label:
+            st.caption(dataset_label)
         sold_count = int(df["is_sold"].sum()) if "is_sold" in df.columns else 0
         st.write(
             {
