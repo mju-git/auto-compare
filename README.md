@@ -63,6 +63,22 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Easiest way (recommended)
+
+Run the whole pipeline (scrape → clean) in one command:
+
+```bash
+python run_pipeline.py "https://suchen.mobile.de/fahrzeuge/search.html?..."
+```
+
+Windows users can also double-click `run_pipeline.bat` and paste the URL.
+
+This will generate the file you upload into the Streamlit app:
+
+- `data/processed/cars_clean.parquet`
+
+### Advanced / manual way
+
 ### 1. Scrape data
 
 ```bash
