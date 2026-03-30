@@ -77,22 +77,19 @@ def main() -> None:
     st.set_page_config(page_title="Auto Compare", layout="wide")
     st.title("Auto Compare")
 
+    tab_dash, tab_upload = st.tabs(["Dashboard", "Upload"])
+
     uploaded_bytes: bytes | None = None
-    use_repo_fallback = True
-    with st.sidebar:
-        st.header("Dataset")
-        with st.expander("Upload `cars_clean.parquet`", expanded=False):
-            st.write("Optional. Upload your cleaned dataset to analyze it here.")
-            up = st.file_uploader("Choose file", type=["parquet"])
-            if up is not None:
-                uploaded_bytes = up.getvalue()
-
-            st.caption(
-                "Streamlit Cloud upload limit is usually ~200MB by default. "
-                "If your parquet is larger, we can reduce columns or compress further."
-            )
-        use_repo_fallback = st.checkbox("Use demo dataset fallback", value=(uploaded_bytes is None))
-
+    with tab_upload:
+        st.subheader("Upload your dataset")
+        st.write("Upload `cars_clean.parquet` (generated locally) to get the full dashboard.")
+        up = st.file_uploader("Choose `cars_clean.parquet`", type=["parquet"])
+        if up is not None:
+            uploaded_bytes = up.getvalue()
+        st.caption(
+            "Streamlit Cloud upload limit is usually ~200MB by default. "
+            "If your parquet is larger, we can reduce columns or compress further."
+        )
         with st.expander("How it works", expanded=False):
             st.write("2-step flow for any user:")
             st.write("1) Scrape locally (so cookie banners / access checks can be solved).")
@@ -120,14 +117,15 @@ def main() -> None:
             st.error(f"Failed to read uploaded parquet: {e}")
             st.stop()
     else:
-        if use_repo_fallback:
-            ensure_clean_parquet()
-            if DATA_PATH.exists():
-                df = load_data_from_path(DATA_PATH)
-                dataset_label = "Demo dataset"
+        # Dashboard default: show your example dataset when present.
+        ensure_clean_parquet()
+        if DATA_PATH.exists():
+            df = load_data_from_path(DATA_PATH)
+            dataset_label = "Example dataset"
 
     if df is None:
-        st.info("Upload `cars_clean.parquet` from the sidebar to begin.")
+        with tab_dash:
+            st.info("Upload `cars_clean.parquet` in the Upload tab to begin.")
         st.stop()
 
     missing_cols = validate_dataset(df)
