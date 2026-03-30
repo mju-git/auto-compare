@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_PATH = BASE_DIR / "data" / "processed" / "cars_clean.parquet"
+
+
+@st.cache_data
+def load_data() -> pd.DataFrame:
+    df = pd.read_parquet(DATA_PATH)
+    # convenience
+    if "is_sold" in df.columns:
+        df["is_sold"] = df["is_sold"].astype(bool)
+    return df
+
+
+def main() -> None:
+    st.set_page_config(page_title="Auto Compare", layout="wide")
+    st.title("Auto Compare")
+
+    if not DATA_PATH.exists():
+        st.error(f"Missing `{DATA_PATH}`. Run `python scripts/clean_cars.py` first.")
+        st.stop()
+
+    df = load_data()
+
+    # Filters
+    with st.sidebar:
+        st.header("Filters")
+
+        show_sold = st.checkbox("Include sold", value=False)
+        if not show_sold and "is_sold" in df.columns:
+            df = df[df["is_sold"] == False]  # noqa: E712
+
+        brand_opts = sorted([b for b in df.get("brand", pd.Series([])).dropna().unique().tolist() if str(b).strip()])
+        brands = st.multiselect("Brand", brand_opts)
+        if brands:
+            df = df[df["brand"].isin(brands)]
+
+        model_opts = sorted([m for m in df.get("model", pd.Series([])).dropna().unique().tolist() if str(m).strip()])
+        models = st.multiselect("Model", model_opts)
+        if models:
+            df = df[df["model"].isin(models)]
+
+        if "price_current_eur_int" in df.columns:
+            pmin = int(df["price_current_eur_int"].dropna().min() or 0)
+            pmax = int(df["price_current_eur_int"].dropna().max() or 0)
+            price_range = st.slider("Price (EUR)", min_value=pmin, max_value=pmax, value=(pmin, pmax))
+            df = df[df["price_current_eur_int"].fillna(-1).between(price_range[0], price_range[1])]
+
+        if "mileage_numeric" in df.columns:
+            km_series = df["mileage_numeric"].dropna()
+            if len(km_series) > 0:
+                km_min = int(km_series.min())
+                km_max = int(km_series.max())
+                km_range = st.slider("Mileage (km)", min_value=km_min, max_value=km_max, value=(km_min, km_max))
+                df = df[df["mileage_numeric"].fillna(-1).between(km_range[0], km_range[1])]
+
+        cond_opts = sorted([c for c in df.get("vehicle_condition_norm", pd.Series([])).dropna().unique().tolist() if str(c).strip()])
+        conds = st.multiselect("Condition", cond_opts)
+        if conds and "vehicle_condition_norm" in df.columns:
+            df = df[df["vehicle_condition_norm"].isin(conds)]
+
+        st.divider()
+        st.caption(f"Rows: {len(df)}")
+
+    # KPIs
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Cars", f"{len(df)}")
+    if "price_current_eur_int" in df.columns:
+        c2.metric("Median price", f"{int(df['price_current_eur_int'].median()) if df['price_current_eur_int'].notna().any() else '—'}")
+    if "mileage_numeric" in df.columns:
+        c3.metric("Median km", f"{int(df['mileage_numeric'].median()) if df['mileage_numeric'].notna().any() else '—'}")
+    if "seller_rating_numeric" in df.columns:
+        med = df["seller_rating_numeric"].dropna().median() if df["seller_rating_numeric"].notna().any() else None
+        c4.metric("Median seller rating", f"{med:.2f}" if med is not None else "—")
+
+    st.divider()
+
+    # Plot styling (modern, consistent)
+    template = "plotly_white"
+    font_family = "Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial"
+
+    def _style(fig: go.Figure) -> go.Figure:
+        fig.update_layout(
+            template=template,
+            font=dict(family=font_family, size=13),
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.06)")
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.06)")
+        return fig
+
+    # Plots
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        st.subheader("Price distribution")
+        if "price_current_eur_int" in df.columns and df["price_current_eur_int"].notna().any():
+            fig = px.histogram(
+                df,
+                x="price_current_eur_int",
+                nbins=30,
+                title="",
+            )
+            fig.update_traces(marker=dict(color="#2563EB"))
+            st.plotly_chart(_style(fig), width="stretch")
+        else:
+            st.info("No price data.")
+
+    with pcol2:
+        st.subheader("Price vs mileage")
+        if {"price_current_eur_int", "mileage_numeric"}.issubset(df.columns) and df["price_current_eur_int"].notna().any():
+            # Make points selectable; we can't auto-open a tab on click,
+            # but we can show a direct link button for the selected point.
+            fig = px.scatter(
+                df,
+                x="mileage_numeric",
+                y="price_current_eur_int",
+                color="vehicle_condition_norm" if "vehicle_condition_norm" in df.columns else None,
+                hover_data=["car_id", "brand", "model"],
+                custom_data=["url", "car_id", "brand", "model"],
+                title="",
+            )
+            fig.update_traces(marker=dict(size=9, opacity=0.75), selector=dict(mode="markers"))
+            fig.update_layout(dragmode="select")
+            selection = st.plotly_chart(_style(fig), width="stretch", on_select="rerun")
+
+            # Streamlit selection payload → show link for first selected point
+            try:
+                points = (selection or {}).get("selection", {}).get("points", [])
+                if points:
+                    cd = points[0].get("customdata") or []
+                    url = cd[0] if len(cd) > 0 else ""
+                    car_id = cd[1] if len(cd) > 1 else ""
+                    brand = cd[2] if len(cd) > 2 else ""
+                    model = cd[3] if len(cd) > 3 else ""
+                    if url:
+                        st.link_button(f"Open ad: {brand} {model} ({car_id})", url)
+            except Exception:
+                pass
+        else:
+            st.info("No mileage/price data.")
+
+    st.divider()
+
+    # Comparison table
+    st.subheader("Compare cars")
+    cols = [
+        "car_id",
+        "brand",
+        "model",
+        "trim",
+        "price_current_eur_int",
+        "mileage_numeric",
+        "first_registration_month",
+        "first_registration_year",
+        "vehicle_condition_norm",
+        "fuel_type",
+        "transmission",
+        "seller_rating_numeric",
+        "url",
+    ]
+    cols = [c for c in cols if c in df.columns]
+    st.dataframe(df[cols].sort_values(["brand", "model"], na_position="last"), use_container_width=True, height=520)
+
+
+if __name__ == "__main__":
+    main()
+

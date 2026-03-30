@@ -2247,6 +2247,7 @@ def phase2_extract_car(driver, url: str, index: int, total: int) -> dict | None:
         for sel in [
             "[data-testid='prime-price']",
             "[data-testid='price-block']",
+            "div.HBWcC",
             ".price-block",
         ]:
             try:

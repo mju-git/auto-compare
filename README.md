@@ -124,6 +124,14 @@ Suggested direction:
   - comparisons across trims/years
   - plots (Plotly) and summary tables
 
+## Streamlit Cloud deployment notes
+
+If you deploy the Streamlit app:
+
+- Set the **app entrypoint** to `app.py` (not `main.py`).
+- `main.py` imports scraper dependencies (Selenium / undetected-chromedriver) which are not needed to run the app.
+- This repo includes `runtime.txt` to pin a compatible Python version on Streamlit Cloud.
+
 
 ## License
 
