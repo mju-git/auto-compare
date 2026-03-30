@@ -10,6 +10,28 @@ import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "data" / "processed" / "cars_clean.parquet"
+RAW_DB_PATH = BASE_DIR / "data" / "raw" / "cars_market.db"
+RAW_JSON_PATH = BASE_DIR / "data" / "raw" / "cars_market_data.json"
+
+def ensure_clean_parquet() -> None:
+    """
+    Streamlit Cloud doesn't have your locally-generated parquet unless it's committed.
+    If the parquet is missing but raw data exists in-repo, build it at runtime.
+    """
+    if DATA_PATH.exists():
+        return
+    if not (RAW_DB_PATH.exists() or RAW_JSON_PATH.exists()):
+        return
+    try:
+        # Reuse the cleaning pipeline to generate the parquet on demand.
+        from scripts.clean_cars import load_raw, build_clean  # type: ignore
+
+        raw = load_raw()
+        clean_df, _qa = build_clean(raw)
+        DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        clean_df.to_parquet(DATA_PATH, index=False)
+    except Exception as e:
+        raise RuntimeError(f"Failed to build {DATA_PATH}: {e}") from e
 
 
 @st.cache_data
@@ -25,8 +47,20 @@ def main() -> None:
     st.set_page_config(page_title="Auto Compare", layout="wide")
     st.title("Auto Compare")
 
+    ensure_clean_parquet()
     if not DATA_PATH.exists():
-        st.error(f"Missing `{DATA_PATH}`. Run `python scripts/clean_cars.py` first.")
+        st.error(
+            "\n".join(
+                [
+                    f"Missing `{DATA_PATH}`.",
+                    "",
+                    "On Streamlit Cloud, this file is not created automatically unless you either:",
+                    "- Commit `data/processed/cars_clean.parquet` to the repo (ok for small datasets), OR",
+                    "- Commit raw input (`data/raw/cars_market.db` or `data/raw/cars_market_data.json`) so the app can build it at runtime, OR",
+                    "- Load the dataset from external storage (recommended later: S3/GCS/DB).",
+                ]
+            )
+        )
         st.stop()
 
     df = load_data()
