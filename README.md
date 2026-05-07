@@ -1,6 +1,23 @@
-# Car Comparison
+# Auto Compare (mobile.de)
 
-A Python project for scraping car listings from mobile.de, cleaning the data, and preparing for analysis and comparison.
+Scrape car listings from `mobile.de`, clean them into an analytics-ready dataset, and explore them in a Streamlit dashboard (filters, plots, comparison table).
+
+**Live demo**: `https://auto-compare.streamlit.app/`
+
+## Highlights
+
+- **End-to-end pipeline**: scrape → SQLite (raw) → Parquet (clean) → dashboard
+- **Clean dataset**: normalized numeric fields (price/km/registration year), equipment list + feature flags
+- **Interactive analysis**: Plotly charts + comparison table + direct links to ads
+- **User-friendly mode**: users scrape locally and upload `cars_clean.parquet` to get a report
+
+## Screenshots
+
+Add screenshots here (recommended for portfolio):
+
+- Dashboard overview
+- Filters + comparison table
+- Price vs mileage scatter
 
 ## Project Structure
 
@@ -152,3 +169,9 @@ If you deploy the Streamlit app:
 ## License
 
 For personal/educational use only. Respect mobile.de's Terms of Service.
+
+## Portfolio notes (what this project demonstrates)
+
+- **Web scraping reliability**: pagination, anti-bot handling, robust extraction + fallbacks
+- **Data engineering**: raw/processed separation, reproducible cleaning pipeline, schema normalization
+- **Product thinking**: upload-first UX (users bring their own dataset), interactive dashboard
