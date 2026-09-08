@@ -41,3 +41,4 @@ cars_market_data.json
 # OS
 .DS_Store
 Thumbs.db
+*.exe 

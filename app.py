@@ -6,7 +6,9 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "data" / "processed" / "cars_clean.parquet"
@@ -45,6 +47,20 @@ def ensure_clean_parquet() -> None:
         clean_df.to_parquet(DATA_PATH, index=False)
     except Exception as e:
         raise RuntimeError(f"Failed to build {DATA_PATH}: {e}") from e
+
+@st.cache_resource
+def get_driver() -> webdriver.Chrome:
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    
+    # Paths configured by Debian packages.txt
+    options.binary_location = "/usr/bin/chromium"
+    service = Service("/usr/bin/chromedriver")
+    
+    return webdriver.Chrome(service=service, options=options)
 
 
 @st.cache_data
